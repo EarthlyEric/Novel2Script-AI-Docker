@@ -57,6 +57,7 @@
           <!-- 输入方式切换 -->
           <div class="input-mode-switch">
             <button
+              type="button"
               class="mode-btn"
               :class="{ active: inputMode === 'text' }"
               @click="inputMode = 'text'"
@@ -65,6 +66,7 @@
               粘贴文本
             </button>
             <button
+              type="button"
               class="mode-btn"
               :class="{ active: inputMode === 'file' }"
               @click="inputMode = 'file'"
@@ -75,7 +77,7 @@
           </div>
 
           <!-- 文本粘贴模式 -->
-          <div v-if="inputMode === 'text'" class="form-group textarea-group">
+          <div v-show="inputMode === 'text'" class="form-group textarea-group">
             <label class="form-label">
               <span class="label-icon">02</span> 小说正文
               <span class="label-hint">支持多章节长文本，系统自动识别章节</span>
@@ -98,7 +100,7 @@
           </div>
 
           <!-- 文件上传模式 -->
-          <div v-else class="form-group upload-group">
+          <div v-show="inputMode === 'file'" class="form-group upload-group">
             <label class="form-label">
               <span class="label-icon">02</span> 选择文件
             </label>
@@ -165,7 +167,7 @@
                     <el-option label="DeepSeek-V3" value="deepseek-chat" />
                     <el-option label="Gemini 2.0 Flash" value="gemini-2.0-flash" />
                     <el-option
-                      label="──────── 自定义 ────────"
+                      label="── 支持自定义 ──"
                       value=""
                       disabled
                       class="custom-divider"
