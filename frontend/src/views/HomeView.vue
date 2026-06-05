@@ -109,7 +109,7 @@
               drag
               :auto-upload="false"
               :limit="1"
-              accept=".txt"
+              accept=".txt,.md,.markdown,.epub"
               :on-change="handleFileChange"
               :on-remove="handleFileRemove"
             >
@@ -117,8 +117,8 @@
                 <div class="upload-icon-wrap">
                   <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
                 </div>
-                <p class="upload-text">拖放 .txt 文件到此处，或 <em>点击选择</em></p>
-                <p class="upload-tip">最大 10MB · UTF-8 编码</p>
+                <p class="upload-text">拖放小说文件到此处，或 <em>点击选择</em></p>
+                <p class="upload-tip">支持 .txt / .md / .epub · 最大 10MB</p>
               </div>
             </el-upload>
           </div>
@@ -207,6 +207,7 @@ import { ref, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { convertNovel } from '@/api/script'
+import JSZip from 'jszip'
 
 const router = useRouter()
 const formRef = ref<FormInstance>()
@@ -233,12 +234,177 @@ const rules: FormRules = {
   ],
 }
 
-function handleFileChange(file: any) {
-  const reader = new FileReader()
-  reader.onload = (e) => {
-    form.novel_text = (e.target?.result as string) || ''
+/**
+ * 处理文件选择变化
+ * 支持 .txt / .md / .markdown / .epub 四种格式
+ * @param file - el-upload 传递的文件对象
+ */
+async function handleFileChange(file: any) {
+  const raw = file.raw
+  if (!raw) return
+
+  const ext = raw.name.split('.').pop()?.toLowerCase()
+
+  try {
+    switch (ext) {
+      case 'txt':
+      case 'md':
+      case 'markdown': {
+        // 纯文本格式：直接读取
+        form.novel_text = await readFileAsText(raw)
+        break
+      }
+      case 'epub': {
+        // EPUB 格式：解压后提取文本内容
+        converting.value = true
+        ElMessage.info('正在解析 EPUB 文件...')
+        form.novel_text = await parseEpubText(raw)
+        ElMessage.success('EPUB 解析完成')
+        break
+      }
+      default:
+        ElMessage.error(`不支持的文件格式：.${ext}`)
+    }
+  } catch (error: any) {
+    console.error('文件读取失败:', error)
+    ElMessage.error(error.message || '文件读取失败')
+  } finally {
+    converting.value = false
   }
-  reader.readAsText(file.raw)
+}
+
+/**
+ * 将 File 对象读取为纯文本字符串
+ * @param file - 要读取的文件对象
+ * @returns 文件的文本内容
+ */
+function readFileAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = (e) => resolve((e.target?.result as string) || '')
+    reader.onerror = () => reject(new Error('文件读取失败'))
+    reader.readAsText(file, 'UTF-8')
+  })
+}
+
+/**
+ * 解析 EPUB 电子书，提取纯文本内容
+ *
+ * EPUB 本质是一个 ZIP 压缩包，内部包含：
+ * - META-INF/container.xml：定位 OPF 文件路径
+ * - *.opf（OEBPS Package Format）：定义书籍结构和章节清单
+ * - *.html / *.xhtml：各章节的实际内容
+ *
+ * @param file - EPUB 文件对象
+ * @returns 提取出的纯文本内容（按章节拼接）
+ * @throws 当文件无法解压或无有效内容时抛出错误
+ */
+async function parseEpubText(file: File): Promise<string> {
+  // 使用 JSZip 解压 EPUB（本质是 ZIP 包）
+  const zip = await JSZip.loadAsync(file)
+
+  // 1. 从 container.xml 中找到 OPF 文件路径
+  const containerXml = await zip.file('META-INF/container.xml')?.async('text')
+  if (!containerXml) throw new Error('无效的 EPUB 文件：缺少 container.xml')
+
+  // 用正则提取 rootfile 的 full-path 属性值
+  const opfMatch = containerXml.match(/full-path="([^"]+)"/)
+  if (!opfMatch) throw new Error('无效的 EPUB 文件：无法定位 OPF 文件')
+  const opfPath = opfMatch[1]
+
+  // 2. 读取 OPF 文件，提取所有章节文件路径（spine 中引用的 idref 对应 manifest 中的 href）
+  const opfContent = await zip.file(opfPath)?.async('text')
+  if (!opfContent) throw new Error('无效的 EPUB 文件：无法读取 OPF 内容')
+
+  // 提取 manifest 中所有 id -> href 映射
+  const manifestMap: Record<string, string> = {}
+  const manifestRegex = /<item\s+id="([^"]+)"\s+href="([^"]+)"/g
+  let m: RegExpExecArray | null
+  while ((m = manifestRegex.exec(opfContent)) !== null) {
+    manifestMap[m[1]] = m[2]
+  }
+
+  // 按 spine 顺序收集章节 ID
+  const spineIds: string[] = []
+  const spineRegex = /<itemref\s+idref="([^"]+)"/g
+  while ((m = spineRegex.exec(opfContent)) !== null) {
+    spineIds.push(m[1])
+  }
+
+  // 3. 如果没有 spine，直接扫描所有 HTML/XHTML 文件作为备选
+  let chapterPaths: string[] = []
+  if (spineIds.length > 0) {
+    const opfDir = opfPath.substring(0, opfPath.lastIndexOf('/') + 1)
+    for (const id of spineIds) {
+      if (manifestMap[id]) {
+        chapterPaths.push(opfDir + manifestMap[id])
+      }
+    }
+  }
+
+  // 备选方案：当 spine 为空时，遍历 ZIP 中所有 HTML/XHTML 文件
+  if (chapterPaths.length === 0) {
+    const htmlRegex = /\.(x?html|xhtm)$/
+    Object.keys(zip.files).forEach((filePath) => {
+      if (htmlRegex.test(filePath) && !filePath.includes('toc')) {
+        chapterPaths.push(filePath)
+      }
+    })
+    // 按文件名排序确保章节顺序稳定
+    chapterPaths.sort()
+  }
+
+  if (chapterPaths.length === 0) {
+    throw new Error('EPUB 文件中未找到任何可读章节内容')
+  }
+
+  // 4. 逐章读取并提取纯文本
+  const chapters: string[] = []
+  for (const path of chapterPaths) {
+    const content = await zip.file(path)?.async('text')
+    if (!content) continue
+
+    // 去除 HTML 标签、解码 HTML 实体、清理多余空白
+    const text = stripHtmlTags(content).trim()
+    if (text.length > 20) {  // 过滤过短的无关页面
+      chapters.push(text)
+    }
+  }
+
+  if (chapters.length === 0) {
+    throw new Error('EPUB 文件中未提取到有效文本内容')
+  }
+
+  // 用双换行分隔章节，保持结构
+  return chapters.join('\n\n\n')
+}
+
+/**
+ * 去除 HTML 标签并清理文本
+ * 处理常见 HTML 实体和多余空白字符
+ * @param html - 含 HTML 标签的字符串
+ * @returns 纯净的纯文本
+ */
+function stripHtmlTags(html: string): string {
+  return html
+    // 替换 <br> 和块级标签为换行
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|h[1-6]|li|tr|section|article)[^>]*>/gi, '\n\n')
+    // 移除所有剩余 HTML 标签
+    .replace(/<[^>]+>/g, '')
+    // 解码常见 HTML 实体
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&mdash;/g, '—')
+    .replace(/&ndash;/g, '–')
+    .replace(/&hellip;/g, '…')
+    // 合并连续空白行（保留最多两个换行）
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 }
 
 function handleFileRemove() {
