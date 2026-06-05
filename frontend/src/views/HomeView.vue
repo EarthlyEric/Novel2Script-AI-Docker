@@ -150,12 +150,26 @@
                 </div>
                 <div class="config-field">
                   <label class="cfg-label">模型</label>
-                  <el-select v-model="form.model_name" placeholder="选择模型" allow-create filterable style="width: 100%">
+                  <el-select
+                    v-model="form.model_name"
+                    placeholder="选择或输入模型"
+                    allow-create
+                    filterable
+                    style="width: 100%"
+                  >
                     <el-option label="GPT-4o Mini" value="gpt-4o-mini" />
                     <el-option label="GPT-4o" value="gpt-4o" />
                     <el-option label="GPT-4 Turbo" value="gpt-4-turbo" />
                     <el-option label="Claude 3.5 Sonnet" value="claude-3-5-sonnet-20241022" />
                     <el-option label="通义千问-Max" value="qwen-max" />
+                    <el-option label="DeepSeek-V3" value="deepseek-chat" />
+                    <el-option label="Gemini 2.0 Flash" value="gemini-2.0-flash" />
+                    <el-option
+                      label="──────── 自定义 ────────"
+                      value=""
+                      disabled
+                      class="custom-divider"
+                    />
                   </el-select>
                 </div>
               </div>
@@ -636,5 +650,13 @@ async function handleSubmit() {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* 自定义模型分隔线 */
+:deep(.custom-divider) {
+  font-size: 11px !important;
+  color: var(--text-muted) !important;
+  cursor: default !important;
+  letter-spacing: 1px;
 }
 </style>

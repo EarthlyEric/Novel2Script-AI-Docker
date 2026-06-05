@@ -142,6 +142,10 @@ body {
   color: var(--text-primary) !important;
   font-family: var(--font-ui) !important;
 }
+.el-input__inner {
+  color: var(--text-primary) !important;
+  background: transparent !important;
+}
 .el-input__wrapper:hover,
 .el-textarea__inner:focus {
   box-shadow: 0 0 0 1px var(--accent) inset !important;
@@ -150,19 +154,44 @@ body {
 .el-textarea__inner::placeholder {
   color: var(--text-muted) !important;
 }
-.el-select .el-input__wrapper {
+/* Select 输入框 — 强制覆盖 */
+.el-select .el-input .el-input__wrapper,
+.el-select .el-input__wrapper,
+.el-select__wrapper .el-input__wrapper,
+.el-select__wrapper {
   background-color: var(--bg-elevated) !important;
+  background-image: none !important;
 }
-.el-select-dropdown {
+.el-select .el-input__suffix {
+  color: var(--text-muted) !important;
+}
+.el-select .el-input.is-focus .el-input__wrapper {
+  box-shadow: 0 0 0 1px var(--accent) inset !important;
+}
+/* Select 下拉弹窗（通过 popper 渲染到 body，需要全局覆盖） */
+.el-select-dropdown,
+.el-popper.is-light,
+.el-popper {
   background-color: var(--bg-elevated) !important;
   border: 1px solid var(--border-medium) !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4) !important;
 }
 .el-select-dropdown__item {
   color: var(--text-primary) !important;
 }
 .el-select-dropdown__item.hover,
-.el-select-dropdown__item:hover {
+.el-select-dropdown__item:hover,
+.el-select-dropdown__item.is-hovering {
   background-color: var(--accent-dim) !important;
+}
+.el-select-dropdown__item.is-selected {
+  color: var(--accent) !important;
+  font-weight: 600 !important;
+}
+.el-popper .popper__arrow::before,
+.el-popper[data-popper-placement] > .popper__arrow::before {
+  background: var(--bg-elevated) !important;
+  border: 1px solid var(--border-medium) !important;
 }
 .el-radio__label {
   color: var(--text-secondary) !important;
@@ -223,6 +252,10 @@ body {
 .el-card__header {
   border-bottom: 1px solid var(--border-subtle) !important;
   color: var(--text-primary) !important;
+}
+.el-input__count {
+  background: transparent !important;
+  color: var(--text-muted) !important;
 }
 /* 页面切换动画 */
 .route-page {
