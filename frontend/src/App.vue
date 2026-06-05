@@ -42,9 +42,11 @@
 
     <!-- 主内容区 -->
     <main class="app-main">
-      <router-view v-slot="{ Component }">
-        <transition name="page-fade" mode="out-in">
-          <component :is="Component" />
+      <router-view v-slot="{ Component, route }">
+        <transition name="page-fade" appear>
+          <div :key="route.path" class="route-page">
+            <component :is="Component" />
+          </div>
         </transition>
       </router-view>
     </main>
@@ -223,9 +225,16 @@ body {
   color: var(--text-primary) !important;
 }
 /* 页面切换动画 */
-.page-fade-enter-active,
-.page-fade-leave-active {
+.route-page {
+  min-height: 200px;
+}
+.page-fade-enter-active {
   transition: opacity 0.35s var(--ease-out), transform 0.35s var(--ease-out);
+}
+.page-fade-leave-active {
+  transition: opacity 0.2s ease-in, transform 0.2s ease-in;
+  position: absolute;
+  width: 100%;
 }
 .page-fade-enter-from {
   opacity: 0;
