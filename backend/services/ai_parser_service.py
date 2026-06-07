@@ -528,12 +528,12 @@ def _split_by_fixed_size(text: str) -> list[str]:
         chunk = text[start:end]
         chunks.append(chunk)
         # 下一片起始位置回退重叠区
-        start = end - CHUNK_OVERLAP
-        # 防止无限循环
-        if start >= len(text):
-            break
-        if start <= end - CHUNK_OVERLAP + 1:
+        next_start = end - CHUNK_OVERLAP
+        # 确保前进：下一片起始必须大于当前起始
+        if next_start <= start:
             start = end
+        else:
+            start = next_start
 
     return chunks
 
@@ -939,7 +939,10 @@ def _extract_and_repair_yaml(ai_output: str) -> str:
     # 步骤4：字段名自动映射 — 将 AI 返回的错误字段名替换为正确的 Schema 字段名
     text = _repair_field_names(text)
 
-    # 步骤5：验证可解析性
+    # 步骤5：缺失必填字段自动注入
+    text = _inject_missing_fields(text)
+
+    # 步骤6：验证可解析性
     try:
         yaml.safe_load(text)
     except yaml.YAMLError:
@@ -979,10 +982,9 @@ def _repair_field_names(yaml_text: str) -> str:
     某些模型（如 LongCat）不严格遵循提示词中的 Schema 定义，会使用自己的字段命名。
     此函数通过正则替换将常见错误映射到正确字段名。
 
-    映射规则按优先级排序：
-      - 精确匹配（如 title → script_title）
-      - 前缀/后缀变体（如 script_name → script_title）
-      - 中文别名（如 剧本名称 → script_title）
+    采用上下文感知策略：根据缩进层级判断字段所属区域，
+    同一字段名在不同层级可能映射到不同目标（如 name 在 meta 下→script_title，
+    在 character 下→char_name）。
 
     Args:
         yaml_text: AI 返回的原始 YAML 文本
@@ -991,114 +993,240 @@ def _repair_field_names(yaml_text: str) -> str:
         str: 字段名已修正的 YAML 文本
     """
     # ============================================================
-    # 字段名映射表：错误字段名 → 正确的 Schema 字段名
-    # 格式：(旧名, 新名) — 按从长到短排列避免部分替换问题
+    # 全局无歧义映射（任何层级都适用的映射）
+    # 格式：(旧名, 新名) — 旧名和新名不同时才会替换
     # ============================================================
-    field_mappings = [
-        # === script_meta 层级 ===
+    global_mappings = [
+        # === script_meta 层级（无歧义）===
         ("script_name", "script_title"),
         ("剧本名称", "script_title"),
         ("剧名", "script_title"),
-        ("name", "script_title"),
-        ("title", "script_title"),
         ("original_title", "original_novel_title"),
         ("原著名称", "original_novel_title"),
         ("小说原名", "original_novel_title"),
         ("novel_title", "original_novel_title"),
-        ("source_author", "author"),
-        ("原著作者", "author"),
-        ("writer", "author"),
-        ("chapter_range", "chapter_range"),  # 保持不变
         ("章节范围", "chapter_range"),
         ("chapters", "chapter_range"),
-        ("total_scenes", "total_scenes"),     # 保持不变
-        ("场景总数", "total_scenes"),
-        ("scene_count", "total_scenes"),
-        ("adapt_summary", "adapt_summary"),   # 保持不变
-        ("改编概要", "adapt_summary"),
-        ("summary", "adapt_summary"),
+        ("改编概要", "adapt_rule_note"),
+        ("adapt_summary", "adapt_rule_note"),
 
-        # === SceneAttr 层级 ===
-        ("scene_id", "scene_id"),             # 保持不变
-        ("id", "scene_id"),
-        ("scene_label", "scene_label"),       # 保持不变
-        ("label", "scene_label"),
-        ("scene_type", "scene_type"),         # 保持不变
-        ("type", "scene_type"),
-        ("location", "location"),             # 保持不变
+        # === SceneAttr 层级（无歧义）===
         ("place", "location"),
         ("地点", "location"),
-        ("time_type", "time_type"),           # 保持不变
-        ("time", "time_type"),
-        ("时间段", "time_type"),
-        ("scene Synopsis", "sceneSynopsis"),  # 处理空格变体
-        ("synopsis", "sceneSynopsis"),
-        ("剧情概要", "sceneSynopsis"),
-        ("summary", "sceneSynopsis"),          # 注意：在 scene 下 summary → sceneSynopsis
 
-        # === SceneContentUnit 层级 ===
-        ("unit_id", "unit_id"),               # 保持不变
-        ("unit_type", "unit_type"),           # 保持不变
-        ("type", "unit_type"),                 # 注意：在 unit 下 type → unit_type
-        ("character_name", "character_name"),  # 保持不变
-        ("char", "character_name"),
-        ("角色", "character_name"),
-        ("speaker", "character_name"),
-        ("content", "content"),               # 保持不变
+        # === SceneContentUnit 层级（无歧义）===
+        ("speaker", "character"),
+        ("character_name", "character"),
+        ("角色", "character"),
         ("text", "content"),
         ("正文", "content"),
         ("对话内容", "content"),
-        ("dialogue", "content"),
-        ("emotion_tag", "emotion_tag"),       # 保持不变
-        ("emotion", "emotion_tag"),
-        ("情绪标签", "emotion_tag"),
-        ("备注", "note"),
-        ("notes", "note"),
-        ("remark", "note"),
 
-        # === GlobalCharacter 层级 ===
-        ("char_id", "char_id"),               # 保持不变
+        # === GlobalCharacter 层级（无歧义）===
         ("character_id", "char_id"),
-        ("char_name", "char_name"),            # 保持不变
-        ("name", "char_name"),                # 注意：在 character 下 name → char_name
-        ("角色名", "char_name"),
-        ("alias", "alias"),                   # 保持不变
-        ("aliases", "alias"),
-        ("别名", "alias"),
-        ("role_type", "role_type"),           # 保持不变
-        ("role", "role_type"),
-        ("角色类型", "role_type"),
-        ("char_profile", "char_profile"),     # 保持不变
-        ("profile", "char_profile"),
         ("简介", "char_profile"),
         ("description", "char_profile"),
         ("人物描述", "char_profile"),
-        ("first_appearance", "first_appearance"),  # 保持不变
-        ("first_scene", "first_appearance"),
-        ("出场场次", "first_appearance"),
+        ("profile", "char_profile"),
+        ("角色名", "char_name"),
     ]
 
-    result = yaml_text
-    replaced: set[str] = set()
+    # ============================================================
+    # 上下文感知映射：根据缩进层级判断
+    # 同名字段在不同层级映射到不同目标
+    # ============================================================
 
-    for old_name, new_name in field_mappings:
-        # 跳过已替换的（避免重复处理保持不变的项）
-        if old_name == new_name and old_name in replaced:
+    lines = yaml_text.split("\n")
+    result_lines = []
+    current_section = "root"  # root / meta / scenes / characters
+
+    for line in result_lines if False else lines:
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+
+        # 检测当前区域
+        if stripped.startswith("script_meta:"):
+            current_section = "meta"
+        elif stripped.startswith("script_scenes:"):
+            current_section = "scenes"
+        elif stripped.startswith("global_characters:"):
+            current_section = "characters"
+        elif indent == 0 and stripped and not stripped.startswith("-") and stripped.endswith(":"):
+            # 其他顶级键，退出当前区域
+            if stripped.startswith("adapt_rule_note:"):
+                current_section = "root"
+
+        # 先应用全局无歧义映射
+        modified_line = line
+        for old_name, new_name in global_mappings:
+            pattern = rf"^(\s*){re.escape(old_name)}\s*:"
+            match = re.match(pattern, modified_line)
+            if match:
+                new_line = re.sub(pattern, rf"\g<1>{new_name}:", modified_line)
+                if new_line != modified_line:
+                    _log(f"[REPAIR] 字段映射: '{old_name}' → '{new_name}' (1 处)")
+                    modified_line = new_line
+
+        # 再应用上下文感知映射
+        # title → script_title (meta层) 或 char_name (characters层)
+        if re.match(r"^(\s*)title\s*:", modified_line):
+            if current_section == "meta":
+                new_line = re.sub(r"^(\s*)title\s*:", r"\g<1>script_title:", modified_line)
+                if new_line != modified_line:
+                    _log("[REPAIR] 字段映射: 'title' → 'script_title' (1 处)")
+                    modified_line = new_line
+
+        # name → script_title (meta层) 或 char_name (characters层)
+        if re.match(r"^(\s*)name\s*:", modified_line):
+            if current_section == "meta":
+                new_line = re.sub(r"^(\s*)name\s*:", r"\g<1>script_title:", modified_line)
+                _log("[REPAIR] 字段映射: 'name' → 'script_title' (1 处)")
+                modified_line = new_line
+            elif current_section == "characters":
+                new_line = re.sub(r"^(\s*)name\s*:", r"\g<1>char_name:", modified_line)
+                _log("[REPAIR] 字段映射: 'name' → 'char_name' (1 处)")
+                modified_line = new_line
+
+        # type → scene_type (scenes层, scene_attr内) 或 unit_type (scenes层, unit内)
+        if re.match(r"^(\s*)type\s*:", modified_line):
+            if current_section == "scenes":
+                # 根据缩进判断：scene_attr内(6+空格) → scene_type, unit内(6+空格) → unit_type
+                if indent >= 8:
+                    new_line = re.sub(r"^(\s*)type\s*:", r"\g<1>unit_type:", modified_line)
+                    _log("[REPAIR] 字段映射: 'type' → 'unit_type' (1 处)")
+                    modified_line = new_line
+                elif indent >= 4:
+                    new_line = re.sub(r"^(\s*)type\s*:", r"\g<1>scene_type:", modified_line)
+                    _log("[REPAIR] 字段映射: 'type' → 'scene_type' (1 处)")
+                    modified_line = new_line
+
+        # summary → scene_summary (scenes层) 或 adapt_rule_note (meta层)
+        if re.match(r"^(\s*)summary\s*:", modified_line):
+            if current_section == "scenes":
+                new_line = re.sub(r"^(\s*)summary\s*:", r"\g<1>scene_summary:", modified_line)
+                _log("[REPAIR] 字段映射: 'summary' → 'scene_summary' (1 处)")
+                modified_line = new_line
+            elif current_section == "meta":
+                new_line = re.sub(r"^(\s*)summary\s*:", r"\g<1>adapt_rule_note:", modified_line)
+                _log("[REPAIR] 字段映射: 'summary' → 'adapt_rule_note' (1 处)")
+                modified_line = new_line
+
+        # synopsis → scene_summary (scenes层)
+        if re.match(r"^(\s*)synopsis\s*:", modified_line):
+            if current_section == "scenes":
+                new_line = re.sub(r"^(\s*)synopsis\s*:", r"\g<1>scene_summary:", modified_line)
+                _log("[REPAIR] 字段映射: 'synopsis' → 'scene_summary' (1 处)")
+                modified_line = new_line
+
+        # time → time_type (scenes层, scene_attr内)
+        if re.match(r"^(\s*)time\s*:", modified_line):
+            if current_section == "scenes":
+                new_line = re.sub(r"^(\s*)time\s*:", r"\g<1>time_type:", modified_line)
+                _log("[REPAIR] 字段映射: 'time' → 'time_type' (1 处)")
+                modified_line = new_line
+
+        # id → scene_id (scenes层, 4空格) 或 unit_id (scenes层, 6+空格)
+        if re.match(r"^(\s*)id\s*:", modified_line):
+            if current_section == "scenes":
+                if indent >= 6:
+                    new_line = re.sub(r"^(\s*)id\s*:", r"\g<1>unit_id:", modified_line)
+                    _log("[REPAIR] 字段映射: 'id' → 'unit_id' (1 处)")
+                    modified_line = new_line
+                elif indent >= 4:
+                    new_line = re.sub(r"^(\s*)id\s*:", r"\g<1>scene_id:", modified_line)
+                    _log("[REPAIR] 字段映射: 'id' → 'scene_id' (1 处)")
+                    modified_line = new_line
+
+        result_lines.append(modified_line)
+
+    return "\n".join(result_lines)
+
+
+def _inject_missing_fields(yaml_text: str) -> str:
+    """
+    自动注入 AI 输出中缺失的必填字段。
+
+    某些模型会遗漏必填字段（如 original_novel_title、chapter_range、scene_serial），
+    导致 Pydantic 校验失败。此函数在 YAML 文本中检测并注入这些缺失字段。
+
+    Args:
+        yaml_text: 经过字段名修复后的 YAML 文本
+
+    Returns:
+        str: 注入缺失字段后的 YAML 文本
+
+    Note:
+        注入的字段使用合理的默认值或空字符串，确保通过 Schema 校验。
+    """
+    lines = yaml_text.split("\n")
+    result_lines = list(lines)
+
+    # 检测 script_meta 中缺失的字段
+    meta_fields_present = set()
+    in_meta = False
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("script_meta:"):
+            in_meta = True
             continue
+        if in_meta:
+            indent = len(line) - len(stripped)
+            if indent == 0 and stripped and not stripped.startswith("#"):
+                in_meta = False
+                continue
+            # 提取字段名
+            field_match = re.match(r"^\s+(\w+)\s*:", stripped)
+            if field_match:
+                meta_fields_present.add(field_match.group(1))
 
-        # 使用正则匹配 YAML 键名：行首 + 可选缩进 + 字段名 + 冒号
-        # 排除已经在冒号右侧的值（如 "title: xxx" 中 xxx 不应被替换）
-        pattern = rf"^(\s*){re.escape(old_name)}\s*:"
-        replacement = rf"\g<1>{new_name}:"
+    # 需要注入的 meta 字段（在 script_meta: 行之后插入）
+    meta_injections = []
+    if "original_novel_title" not in meta_fields_present:
+        meta_injections.append("  original_novel_title: \"\"")
+        _log("[REPAIR] 注入缺失字段: 'original_novel_title'")
+    if "chapter_range" not in meta_fields_present:
+        meta_injections.append("  chapter_range: \"\"")
+        _log("[REPAIR] 注入缺失字段: 'chapter_range'")
+    if "create_time" not in meta_fields_present:
+        from datetime import datetime
+        meta_injections.append(f"  create_time: \"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\"")
+        _log("[REPAIR] 注入缺失字段: 'create_time'")
 
-        matches = re.findall(pattern, result, re.MULTILINE)
-        if matches:
-            result = re.sub(pattern, replacement, result, flags=re.MULTILINE)
-            if old_name != new_name:
-                _log(f"[REPAIR] 字段映射: '{old_name}' → '{new_name}' ({len(matches)} 处)")
-                replaced.add(old_name)
+    # 在 script_meta: 行之后插入缺失字段
+    if meta_injections:
+        new_lines = []
+        for line in result_lines:
+            new_lines.append(line)
+            if line.lstrip().startswith("script_meta:"):
+                for injection in meta_injections:
+                    new_lines.append(injection)
+        result_lines = new_lines
 
-    return result
+    # 检测 script_scenes 中缺失的 scene_serial 字段
+    # 为每个 scene 自动生成 scene_serial
+    has_serial = any("scene_serial:" in line for line in result_lines)
+    if not has_serial:
+        new_lines = []
+        scene_counter = 0
+        for line in result_lines:
+            stripped = line.lstrip()
+            # 检测 scene 条目开始（如 "  - scene_id:"）
+            if re.match(r"^\s+-\s+scene_id\s*:", stripped) or re.match(r"^\s+-\s+id\s*:", stripped):
+                scene_counter += 1
+                new_lines.append(line)
+                # 在 scene_id 行之后插入 scene_serial
+                indent_match = re.match(r"^(\s+)-", line)
+                if indent_match:
+                    base_indent = indent_match.group(1)
+                    new_lines.append(f"{base_indent}  scene_serial: \"S{scene_counter:02d}\"")
+                    _log(f"[REPAIR] 注入缺失字段: 'scene_serial' → S{scene_counter:02d}")
+                else:
+                    new_lines.append(f"    scene_serial: \"S{scene_counter:02d}\"")
+            else:
+                new_lines.append(line)
+        result_lines = new_lines
+
+    return "\n".join(result_lines)
 
 
 def _aggressive_yaml_repair(text: str) -> str:
