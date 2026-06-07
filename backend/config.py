@@ -27,7 +27,7 @@ class AIConfig:
         model_name: str = "gpt-4o-mini",
         temperature: float = 0.7,
         max_tokens: int = 16384,
-        timeout: int = 120,
+        timeout: int = 300,
     ):
         """
         初始化AI配置，优先使用传入参数，否则从环境变量读取，最后使用默认值。

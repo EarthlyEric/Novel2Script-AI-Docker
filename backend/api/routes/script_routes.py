@@ -3,9 +3,13 @@
 
 提供小说转剧本的核心 HTTP 接口，包括：
 - POST /api/script/convert   — 小说文本转换为结构化YAML剧本
+- POST /api/script/test-connection — 测试LLM模型连通性
 - GET  /api/script/schema    — 获取 YAML Schema 规范说明
 - POST /api/script/validate  — 校验 YAML 内容是否符合 Schema
 """
+
+import sys
+import time
 
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException
 
@@ -21,6 +25,17 @@ from backend.services.text_preprocessor import preprocess_novel_text
 from backend.services.yaml_renderer import render_script_yaml
 
 router = APIRouter(prefix="/script", tags=["剧本转换"])
+
+
+def log(msg: str) -> None:
+    """
+    立即刷新的日志输出函数。
+
+    解决 uvicorn 运行时 stdout 缓冲导致 log() 不即时显示的问题。
+    所有日志通过此函数输出，确保在终端中实时可见。
+    """
+    print(msg, flush=True)
+    sys.stdout.flush()
 
 
 @router.post("/convert", response_model=ConvertResponse)
@@ -67,8 +82,10 @@ async def convert_novel_to_script(
         if novel_file and novel_file.filename:
             content = await novel_file.read()
             raw_text = content.decode("utf-8", errors="ignore")
+            log(f"[CONVERT] 收到文件上传: {novel_file.filename}, 大小: {len(content)} 字节")
         elif novel_text and novel_text.strip():
             raw_text = novel_text.strip()
+            log(f"[CONVERT] 收到文本粘贴: {len(raw_text)} 字符")
         else:
             raise HTTPException(
                 status_code=400,
@@ -76,7 +93,10 @@ async def convert_novel_to_script(
             )
 
         # 步骤2：文本预处理
+        log(f"[CONVERT] 开始预处理，输入长度: {len(raw_text)} 字符")
         preprocess_result = preprocess_novel_text(raw_text)
+        log(f"[CONVERT] 预处理完成: 章节范围={preprocess_result.chapter_range}, "
+              f"输出长度={len(preprocess_result.clean_text)} 字符")
 
         # 步骤3：构建AI配置（使用前端传入值覆盖默认值）
         config = AIConfig(
@@ -84,13 +104,19 @@ async def convert_novel_to_script(
             base_url=base_url or "",
             model_name=model_name or "",
         )
+        log(f"[CONVERT] AI配置: model={config.model_name}, base_url={config.base_url}, "
+              f"timeout={config.timeout}s")
 
         # 步骤4：AI解析转换
+        start_time = time.time()
         script_data = parse_novel_to_script(
             novel_text=preprocess_result.clean_text,
             novel_title=novel_title,
             config=config,
         )
+        elapsed = round(time.time() - start_time, 1)
+        log(f"[CONVERT] AI解析完成! 耗时: {elapsed}s, 场景数: {len(script_data.script_scenes)}, "
+              f"角色数: {len(script_data.global_characters)}")
 
         # 步骤5：更新元数据中的章节范围信息
         script_data.script_meta.chapter_range = preprocess_result.chapter_range
@@ -101,15 +127,149 @@ async def convert_novel_to_script(
         return ConvertResponse(
             success=True,
             message=f"成功转换，共生成 {len(script_data.script_scenes)} 场戏、"
-                    f"{len(script_data.global_characters)} 个角色",
+                    f"{len(script_data.global_characters)} 个角色（耗时 {elapsed}s）",
             data=script_data,
             yaml_text=yaml_text,
         )
 
     except ValueError as e:
+        log(f"[CONVERT] 参数错误: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
+        err_type = type(e).__name__
+        err_str = str(e)
+        log(f"[CONVERT] 异常({err_type}): {err_str[:500]}")
+        raise HTTPException(status_code=500, detail=f"服务器内部错误 [{err_type}]: {err_str[:300]}")
+
+
+@router.post("/test-connection")
+async def test_llm_connection(
+    api_key: str = Form(..., description="API Key"),
+    base_url: str = Form(..., description="API Base URL"),
+    model_name: str = Form(..., description="模型名称"),
+):
+    """
+    测试 LLM 模型接口连通性。
+
+    发送一条最简请求到 AI 接口，验证：
+    - API Key 是否有效
+    - Base URL 是否可达
+    - 模型名称是否被支持
+    - 接口是否正常响应
+
+    Args:
+        api_key: API 密钥
+        base_url: API 地址
+        model_name: 模型名称
+
+    Returns:
+        dict: 包含 success/message/latency/model 的测试结果
+    """
+    from openai import (
+        OpenAI,
+        AuthenticationError,
+        NotFoundError,
+        RateLimitError,
+        APITimeoutError,
+        APIConnectionError,
+        APIStatusError,
+    )
+
+    try:
+        # 测试连接给 30 秒超时，比正式转换更宽松
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=30)
+        start_time = time.time()
+
+        log(f"[TEST] 开始测试连接: base_url={base_url}, model={model_name}")
+
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "user", "content": "Hi, reply with only: OK"},
+            ],
+            max_tokens=5,
+            temperature=0,
+        )
+
+        latency_ms = round((time.time() - start_time) * 1000, 0)
+
+        # 安全解析响应，兼容不同平台的返回格式差异
+        content = ""
+        try:
+            if response.choices and len(response.choices) > 0:
+                msg = response.choices[0].message
+                if msg:
+                    content = (msg.content or "").strip()
+            if not content:
+                content = "(空回复)"
+        except Exception as parse_err:
+            log(f"[TEST] 响应解析警告: {parse_err}")
+            content = f"(解析异常: {str(parse_err)[:50]})"
+
+        log(f"[TEST] 连接成功: model={model_name}, latency={latency_ms}ms, reply={content[:30]}")
+
+        return {
+            "success": True,
+            "message": "连接成功",
+            "latency_ms": latency_ms,
+            "model": model_name,
+            "reply_preview": content[:50],
+        }
+
+    except AuthenticationError as e:
+        err_msg = f"认证失败: API Key 无效 - {str(e)[:100]}"
+        log(f"[TEST] {err_msg}")
+        raise HTTPException(status_code=401, detail=err_msg)
+
+    except NotFoundError as e:
+        err_msg = f"模型不支持: {model_name} 不存在于此平台 - {str(e)[:150]}"
+        log(f"[TEST] {err_msg}")
+        raise HTTPException(status_code=400, detail=err_msg)
+
+    except APITimeoutError as e:
+        err_msg = f"请求超时(>30s): {base_url} 响应过慢，请检查网络或更换区域 - {str(e)[:100]}"
+        log(f"[TEST] {err_msg}")
+        raise HTTPException(status_code=504, detail=err_msg)
+
+    except APIConnectionError as e:
+        err_msg = f"无法连接: 无法访问 {base_url}，请检查地址是否正确 - {str(e)[:150]}"
+        log(f"[TEST] {err_msg}")
+        raise HTTPException(status_code=502, detail=err_msg)
+
+    except RateLimitError as e:
+        err_msg = f"频率限制: 请求过于频繁，请稍后再试 - {str(e)[:150]}"
+        log(f"[TEST] {err_msg}")
+        raise HTTPException(status_code=429, detail=err_msg)
+
+    except APIStatusError as e:
+        # 处理其他 HTTP 错误（400/500 等），提取详细原因
+        status = e.status_code
+        err_body = ""
+        if hasattr(e, 'body') and e.body:
+            try:
+                import json
+                if isinstance(e.body, dict):
+                    err_body = json.dumps(e.body, ensure_ascii=False)[:200]
+                else:
+                    err_body = str(e.body)[:200]
+            except Exception:
+                err_body = str(e.body)[:200]
+
+        # 特殊处理：模型不支持的错误可能在 400 中以 body 形式返回
+        if status == 400 and ("model" in str(e).lower() or "Unsupported" in str(e) or "invalid_parameter" in str(e)):
+            err_msg = f"模型不支持: {model_name} 不存在于此平台 - {err_body or str(e)[:200]}"
+        elif status == 400:
+            err_msg = f"请求参数错误 - {err_body or str(e)[:200]}"
+        else:
+            err_msg = f"API 返回错误(HTTP {status}) - {err_body or str(e)[:200]}"
+
+        log(f"[TEST] {err_msg}")
+        raise HTTPException(status_code=status, detail=err_msg)
+
+    except Exception as e:
+        err_str = str(e)
+        log(f"[TEST] 未预期异常 ({type(e).__name__}): {err_str[:300]}")
+        raise HTTPException(status_code=500, detail=f"未知错误({type(e).__name__}): {err_str[:200]}")
 
 
 @router.get("/schema")

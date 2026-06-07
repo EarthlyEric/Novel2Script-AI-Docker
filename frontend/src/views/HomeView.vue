@@ -175,6 +175,29 @@
                   </el-select>
                 </div>
               </div>
+              <!-- 测试连接按钮 -->
+              <div class="test-conn-row">
+                <button
+                  type="button"
+                  class="test-conn-btn"
+                  :class="{ testing: testingConn }"
+                  :disabled="testingConn || !form.api_key || !form.base_url || !form.model_name"
+                  @click="handleTestConnection"
+                >
+                  <span v-if="!testingConn" class="btn-inner">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                    测试连接
+                  </span>
+                  <span v-else class="btn-inner spinning">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-dasharray="32" stroke-dashoffset="32"><animate attributeName="stroke-dashoffset" values="32;0" dur="1s" repeatCount="indefinite"/></circle></svg>
+                    测试中...
+                  </span>
+                </button>
+                <span v-if="connResult" class="conn-result" :class="connResult.success ? 'ok' : 'err'">
+                  {{ connResult.message }}
+                  <span v-if="connResult.latency_ms" class="conn-latency">{{ connResult.latency_ms }}ms</span>
+                </span>
+              </div>
             </div>
           </details>
 
@@ -206,7 +229,7 @@
 import { ref, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
-import { convertNovel } from '@/api/script'
+import { convertNovel, testConnection } from '@/api/script'
 import JSZip from 'jszip'
 
 const router = useRouter()
@@ -214,6 +237,8 @@ const formRef = ref<FormInstance>()
 const uploadRef = ref()
 const inputMode = ref<'text' | 'file'>('text')
 const converting = ref(false)
+const testingConn = ref(false)
+const connResult = ref<{ success: boolean; message: string; latency_ms?: number } | null>(null)
 
 const form = reactive({
   novel_title: '',
@@ -411,12 +436,48 @@ function handleFileRemove() {
   form.novel_text = ''
 }
 
+/**
+ * 测试 LLM 模型接口连通性
+ * 发送最简请求验证 API Key / Base URL / 模型名是否有效
+ */
+async function handleTestConnection() {
+  if (!form.api_key || !form.base_url || !form.model_name) {
+    ElMessage.warning('请先填写完整的 AI 配置信息')
+    return
+  }
+
+  testingConn.value = true
+  connResult.value = null
+
+  try {
+    const result = await testConnection(form.api_key, form.base_url, form.model_name)
+    connResult.value = result as any
+    ElMessage.success(`连接成功 - ${result.model} (${result.latency_ms}ms)`)
+  } catch (error: any) {
+    // 区分网络超时和服务端返回的错误
+    let msg = error.message || '连接测试失败'
+    if (error.code === 'ECONNABORTED' || msg.includes('timeout')) {
+      msg = '请求超时：API 响应时间过长（>35秒），请检查网络或更换响应更快的模型'
+    }
+    connResult.value = { success: false, message: msg }
+    ElMessage.error(msg)
+  } finally {
+    testingConn.value = false
+  }
+}
+
 async function handleSubmit() {
   if (!formRef.value) return
   try {
     await formRef.value.validate()
   } catch {
     ElMessage.warning('请完善表单信息')
+    return
+  }
+
+  // 提交前检查 AI 配置是否完整
+  if (!form.api_key || !form.base_url || !form.model_name) {
+    ElMessage.warning('请先填写完整的 AI 模型配置（API Key / 地址 / 模型名）')
     return
   }
 
@@ -440,7 +501,18 @@ async function handleSubmit() {
       ElMessage.error(result.message || '转换失败')
     }
   } catch (error: any) {
-    ElMessage.error(error.message || '转换请求失败')
+    // 区分不同错误类型给出明确提示
+    let msg = error.message || '转换请求失败'
+    if (error.code === 'ECONNABORTED' || msg.includes('timeout')) {
+      msg = '转换超时：文本较长时处理时间可能超过10分钟，请尝试缩短文本或使用更快的模型'
+    } else if (msg.includes('429') || msg.includes('rate_limit')) {
+      msg = 'API 频率限制：请求过于频繁，请稍后再试'
+    } else if (msg.includes('401') || msg.includes('认证')) {
+      msg = '认证失败：请检查 API Key 是否正确'
+    } else if (msg.includes('400') && msg.includes('模型')) {
+      msg = '模型不支持：当前模型名不被该 API 平台支持，请先测试连接确认'
+    }
+    ElMessage.error(msg)
   } finally {
     converting.value = false
   }
@@ -826,5 +898,79 @@ async function handleSubmit() {
   color: var(--text-muted) !important;
   cursor: default !important;
   letter-spacing: 1px;
+}
+
+/* 测试连接按钮行 */
+.test-conn-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-subtle);
+}
+.test-conn-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: var(--font-ui);
+  cursor: pointer;
+  transition: all 0.25s var(--ease-out);
+  white-space: nowrap;
+}
+.test-conn-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(201, 162, 39, 0.08);
+}
+.test-conn-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.test-conn-btn.testing {
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+.btn-inner {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.spinning svg {
+  animation: spin 1s linear infinite;
+}
+
+/* 连接测试结果 */
+.conn-result {
+  font-size: 12px;
+  font-weight: 500;
+  padding: 3px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+.conn-result.ok {
+  background: rgba(34, 197, 94, 0.12);
+  color: #4ade80;
+  border: 1px solid rgba(34, 197, 94, 0.2);
+}
+.conn-result.err {
+  background: rgba(239, 68, 68, 0.12);
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+.conn-latency {
+  margin-left: 6px;
+  opacity: 0.7;
+  font-weight: 400;
 }
 </style>

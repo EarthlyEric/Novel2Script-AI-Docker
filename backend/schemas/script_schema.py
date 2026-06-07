@@ -71,6 +71,7 @@ class SceneAttr(BaseModel):
     def validate_scene_type(cls, v: str) -> str:
         """
         校验场景类型是否为合法值。
+        对于不在枚举范围内的值，尝试模糊匹配到最接近的合法值。
 
         Args:
             v: 待校验的场景类型字符串
@@ -79,18 +80,37 @@ class SceneAttr(BaseModel):
             str: 校验通过后的场景类型值
 
         Raises:
-            ValueError: 场景类型不在允许范围内时抛出
+            ValueError: 场景类型不在允许范围内且无法匹配时抛出
         """
         allowed = {"内景", "外景", "INT", "EXT"}
-        if v not in allowed:
-            raise ValueError(f"scene_type 必须为 {allowed} 之一，当前值: {v}")
-        return v
+        if v in allowed:
+            return v
+
+        # 模糊匹配
+        fuzzy_map = {
+            "int": "INT", "内": "内景", "室内": "内景",
+            "ext": "EXT", "外": "外景", "室外": "外景",
+            "inside": "INT", "interior": "INT",
+            "outside": "EXT", "exterior": "EXT",
+        }
+        v_lower = v.strip().lower()
+        if v_lower in fuzzy_map:
+            return fuzzy_map[v_lower]
+
+        # 关键词包含匹配
+        for keyword, target in [("内", "内景"), ("INT", "INT"), ("int", "INT"),
+                                 ("外", "外景"), ("EXT", "EXT"), ("ext", "EXT")]:
+            if keyword in v:
+                return target
+
+        raise ValueError(f"scene_type 必须为 {allowed} 之一（已尝试模糊匹配），当前值: {v}")
 
     @field_validator("time_type")
     @classmethod
     def validate_time_type(cls, v: str) -> str:
         """
         校验时间段是否为合法值。
+        对于不在枚举范围内的值，尝试模糊匹配到最接近的合法值。
 
         Args:
             v: 待校验的时间类型字符串
@@ -99,12 +119,52 @@ class SceneAttr(BaseModel):
             str: 校验通过后的时间类型值
 
         Raises:
-            ValueError: 时间类型不在允许范围内时抛出
+            ValueError: 无法匹配任何合法时间段时抛出
         """
         allowed = {"日", "夜", "黄昏", "凌晨", "DAY", "NIGHT", "DUSK", "DAWN"}
-        if v not in allowed:
-            raise ValueError(f"time_type 必须为 {allowed} 之一，当前值: {v}")
-        return v
+        if v in allowed:
+            return v
+
+        # 模糊匹配：AI 可能返回组合词或近似表达，尝试自动修正
+        fuzzy_map = {
+            "凌晨至黎明": "凌晨",
+            "黎明": "凌晨",
+            "清晨": "日",
+            "早晨": "日",
+            "上午": "日",
+            "中午": "日",
+            "下午": "日",
+            "傍晚": "黄昏",
+            "傍晚至夜间": "黄昏",
+            "晚间": "夜",
+            "深夜": "夜",
+            "午夜": "夜",
+            "深夜至凌晨": "凌晨",
+            "白天": "日",
+            "黑夜": "夜",
+            "白天至夜晚": "日",
+            "dawn": "DAWN",
+            "morning": "DAY",
+            "afternoon": "DAY",
+            "evening": "DUSK",
+            "night": "NIGHT",
+            "midnight": "NIGHT",
+        }
+        v_lower = v.strip()
+        if v_lower in fuzzy_map:
+            return fuzzy_map[v_lower]
+
+        # 关键词包含匹配
+        for keyword, target in [
+            ("凌晨", "凌晨"), ("黎明", "凌晨"), ("DAWN", "DAWN"), ("dawn", "DAWN"),
+            ("黄昏", "黄昏"), ("傍晚", "黄昏"), ("DUSK", "DUSK"), ("dusk", "DUSK"),
+            ("夜", "夜"), ("夜晚", "夜"), ("NIGHT", "NIGHT"), ("night", "NIGHT"),
+            ("日", "日"), ("白天", "日"), ("DAY", "DAY"), ("day", "DAY"),
+        ]:
+            if keyword in v_lower:
+                return target
+
+        raise ValueError(f"time_type 必须为 {allowed} 之一（已尝试模糊匹配），当前值: {v}")
 
 
 class SceneContentUnit(BaseModel):

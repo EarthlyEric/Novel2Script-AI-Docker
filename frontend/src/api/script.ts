@@ -62,6 +62,7 @@ export async function convertNovel(params: ConvertParams): Promise<ConvertResult
 
   return request.post('/script/convert', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 600000, // 转换请求10分钟超时（长文本分片处理可能耗时较长）
   })
 }
 
@@ -72,6 +73,32 @@ export async function convertNovel(params: ConvertParams): Promise<ConvertResult
  */
 export async function getSchemaInfo(): Promise<unknown> {
   return request.get('/script/schema')
+}
+
+/**
+ * 测试 LLM 模型接口连通性
+ *
+ * 发送最简请求验证 API Key、Base URL、模型名是否有效
+ *
+ * @param apiKey - API 密钥
+ * @param baseUrl - API 地址
+ * @param modelName - 模型名称
+ * @returns 测试结果，包含 success/message/latency_ms 等
+ */
+export async function testConnection(
+  apiKey: string,
+  baseUrl: string,
+  modelName: string,
+): Promise<{ success: boolean; message: string; latency_ms?: number; model?: string; reply_preview?: string }> {
+  const formData = new FormData()
+  formData.append('api_key', apiKey)
+  formData.append('base_url', baseUrl)
+  formData.append('model_name', modelName)
+
+  return request.post('/script/test-connection', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 35000, // 连接测试35秒超时（后端30s + 网络缓冲）
+  })
 }
 
 /**
