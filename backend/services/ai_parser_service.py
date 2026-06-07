@@ -5,17 +5,20 @@ AI 解析服务模块
 转换为符合 YAML Schema 规范的结构化剧本数据。
 
 核心功能：
-- 滑动分片：超长文本按3500字/片切割，章节边界优先，600字重叠
+- 滑动分片：超长文本按6000字/片切割，章节边界优先，800字重叠
 - 全局人物缓存：前置轻量LLM调用提取全文档人物，分片共用
 - 摘要锚定：每片输出后提炼150字摘要，注入下一片上下文
 - YAML三层防护：提示词强约束 + 语法校验修复 + 兜底补全
 - 心理占比巡检：psy超过8%自动触发二次精简
+- 智能限流：429速率限制自动指数退避重试 + 分片间调用间隔控制
 - 后端汇总合并：多片YAML的ID全局重排去重
 """
 
 import json
 import os
 import re
+import sys
+import time
 from dataclasses import dataclass, field
 
 import yaml
@@ -36,9 +39,9 @@ from backend.schemas.script_schema import (
 # ============================================================
 
 # 单分片正文阈值（汉字数）
-CHUNK_SIZE = 3500
+CHUNK_SIZE = 6000
 # 相邻分片重叠区字数
-CHUNK_OVERLAP = 600
+CHUNK_OVERLAP = 800
 # 摘要最大字数
 SUMMARY_MAX_LENGTH = 150
 # psy 占比阈值（超过则触发精简）
@@ -46,6 +49,30 @@ PSY_RATIO_THRESHOLD = 0.08
 # 人物预提取最大输入字数（取全文前5000字 + 后2000字）
 CHAR_EXTRACT_HEAD = 5000
 CHAR_EXTRACT_TAIL = 2000
+
+# ============================================================
+# 限流控制配置
+# ============================================================
+
+# 分片间最小调用间隔（秒），防止连续请求触发速率限制
+CHUNK_CALL_INTERVAL = 2.0
+# 429 限流错误退避初始等待时间（秒）
+RATE_LIMIT_BACKOFF_START = 5.0
+# 429 限流错误退避最大等待时间（秒）
+RATE_LIMIT_BACKOFF_MAX = 60.0
+# 429 限流最大自动重试次数（独立于 max_retries，专门处理限流）
+RATE_LIMIT_MAX_RETRIES = 3
+
+
+def _log(msg: str) -> None:
+    """
+    立即刷新的日志输出函数（AI 解析服务专用）。
+
+    解决 uvicorn 运行时 stdout 缓冲导致 _log() 不即时显示的问题。
+    所有 [AI] 前缀日志通过此函数输出，确保在终端中实时可见。
+    """
+    print(msg, flush=True)
+    sys.stdout.flush()
 
 
 # ============================================================
@@ -130,6 +157,7 @@ def parse_novel_to_script(
     novel_title: str,
     config: AIConfig | None = None,
     max_retries: int = 2,
+    progress_callback=None,
 ) -> ScriptYAML:
     """
     调用 AI 大模型将小说文本转换为结构化剧本。
@@ -146,6 +174,10 @@ def parse_novel_to_script(
         novel_title: 小说/原著名称
         config: AI模型配置实例，为 None 时使用默认配置
         max_retries: 最大重试次数，当 AI 返回格式不合法时触发
+        progress_callback: 可选的进度回调函数，签名为 callback(event_type, data)
+                         event_type 包括: start/preprocessing/preprocessed/
+                         extracting_chars/chars_extracted/chunking/chunks_ready/
+                         chunk_start/chunk_done/chunk_fail/merging/done/error
 
     Returns:
         ScriptYAML: 校验通过的结构化剧本数据
@@ -165,6 +197,17 @@ def parse_novel_to_script(
     if not config.api_key:
         raise ValueError("API Key 未配置，请在设置中填写有效的 API Key")
 
+    # 进度回调辅助函数
+    def _emit(event_type: str, data: dict | None = None) -> None:
+        """安全调用进度回调，忽略异常"""
+        if progress_callback:
+            try:
+                progress_callback(event_type, data or {})
+            except Exception:
+                pass
+
+    _emit("start", {"text_length": len(novel_text), "novel_title": novel_title})
+
     # 初始化 OpenAI 客户端
     client = OpenAI(
         base_url=config.base_url,
@@ -176,10 +219,28 @@ def parse_novel_to_script(
 
     # 短文本：直接单次调用
     if text_length <= CHUNK_SIZE:
-        return _parse_single_chunk(novel_text, novel_title, config, client, max_retries)
+        _emit("parsing_single", {"text_length": text_length})
+        result = _parse_single_chunk(
+            novel_text, novel_title, config, client, max_retries, progress_callback
+        )
+        _emit("done", {
+            "scenes": len(result.script_scenes),
+            "characters": len(result.global_characters),
+        })
+        return result
 
     # 长文本：分片处理流程
-    return _parse_with_chunking(novel_text, novel_title, config, client, max_retries)
+    _log(f"[AI] 文本长度 {text_length} 字，进入分片处理模式（阈值: {CHUNK_SIZE}）")
+    _log(f"[AI] AI配置: model={config.model_name}, base_url={config.base_url}, api_key={'***' if config.api_key else '(空)'}")
+    _emit("parsing_chunks", {"text_length": text_length})
+    result = _parse_with_chunking(
+        novel_text, novel_title, config, client, max_retries, progress_callback
+    )
+    _emit("done", {
+        "scenes": len(result.script_scenes),
+        "characters": len(result.global_characters),
+    })
+    return result
 
 
 # ============================================================
@@ -193,6 +254,7 @@ def _parse_single_chunk(
     config: AIConfig,
     client: OpenAI,
     max_retries: int,
+    progress_callback=None,
 ) -> ScriptYAML:
     """
     短文本单次调用路径，无需分片。
@@ -203,6 +265,7 @@ def _parse_single_chunk(
         config: AI配置
         client: OpenAI客户端
         max_retries: 最大重试次数
+        progress_callback: 进度回调函数
 
     Returns:
         ScriptYAML: 结构化剧本数据
@@ -210,6 +273,14 @@ def _parse_single_chunk(
     Raises:
         RuntimeError: AI解析失败且重试耗尽时抛出
     """
+    def _emit(event_type: str, data: dict | None = None) -> None:
+        if progress_callback:
+            try:
+                progress_callback(event_type, data or {})
+            except Exception:
+                pass
+
+    _emit("calling_llm", {"mode": "single", "retries": max_retries})
     system_prompt = _load_prompt("system_prompt.txt")
     user_message = _build_user_message(novel_text, novel_title)
 
@@ -244,6 +315,7 @@ def _parse_with_chunking(
     config: AIConfig,
     client: OpenAI,
     max_retries: int,
+    progress_callback=None,
 ) -> ScriptYAML:
     """
     长文本分片处理主流程。
@@ -261,6 +333,7 @@ def _parse_with_chunking(
         config: AI配置
         client: OpenAI客户端
         max_retries: 最大重试次数
+        progress_callback: 进度回调函数
 
     Returns:
         ScriptYAML: 合并后的完整结构化剧本数据
@@ -268,11 +341,24 @@ def _parse_with_chunking(
     Raises:
         RuntimeError: 所有分片均解析失败时抛出
     """
+    def _emit(event_type: str, data: dict | None = None) -> None:
+        if progress_callback:
+            try:
+                progress_callback(event_type, data or {})
+            except Exception:
+                pass
+
     # 步骤1：前置人物预提取
+    _emit("extracting_chars", {})
     char_cache = _extract_characters(novel_text, client, config)
+    _emit("chars_extracted", {"char_count": len(char_cache.get_all_names())})
 
     # 步骤2：滑动分片
+    _emit("chunking", {"text_length": len(novel_text)})
     chunks = _split_into_chunks(novel_text)
+    total_chunks = len(chunks)
+    _log(f"[AI] 共切割为 {total_chunks} 个分片")
+    _emit("chunks_ready", {"total": total_chunks})
 
     # 步骤3：逐片AI转换
     chunk_results: list[ScriptYAML] = []
@@ -301,13 +387,28 @@ def _parse_with_chunking(
             chunk_text, novel_title, chunk_index, total_chunks
         )
 
+        # 调用AI前等待，避免连续请求触发速率限制
+        if i > 0:
+            _log(f"[AI] [WAIT] 等待 {CHUNK_CALL_INTERVAL}s 后处理分片 {chunk_index}/{total_chunks} ...")
+            _emit("chunk_wait", {"index": chunk_index, "total": total_chunks, "wait_seconds": CHUNK_CALL_INTERVAL})
+            time.sleep(CHUNK_CALL_INTERVAL)
+
         # 调用AI（带重试）
+        _emit("chunk_start", {"index": chunk_index, "total": total_chunks})
         chunk_result = _parse_chunk_with_retry(
             system_prompt, user_message, config, client, max_retries
         )
         if chunk_result is None:
+            _log(f"[AI] [FAIL] 分片 {chunk_index}/{total_chunks} 解析失败，跳过")
+            _emit("chunk_fail", {"index": chunk_index, "total": total_chunks})
             continue
 
+        scene_count = len(chunk_result.script_scenes)
+        _log(f"[AI] [OK] 分片 {chunk_index}/{total_chunks} 解析成功（{scene_count} 场戏）")
+        _emit("chunk_done", {
+            "index": chunk_index, "total": total_chunks, "scenes": scene_count,
+            "completed": len(chunk_results) + 1,
+        })
         chunk_results.append(chunk_result)
 
         # 提取摘要锚点
@@ -316,12 +417,19 @@ def _parse_with_chunking(
         id_offset = _calc_next_id_offset(chunk_result, id_offset)
 
     if not chunk_results:
-        raise RuntimeError("所有分片解析均失败，无法生成剧本")
+        _emit("error", {"message": "所有分片解析均失败"})
+        raise RuntimeError(
+            f"所有分片解析均失败，无法生成剧本（共 {len(chunks)} 个分片）。"
+            f"请检查：1) API Key / Base URL 是否正确 2) 模型名称是否有效 "
+            f"3) 后端终端日志中的 [AI] 详细错误信息"
+        )
 
     # 步骤4：后端汇总合并
+    _emit("merging", {"completed_chunks": len(chunk_results), "total_chunks": total_chunks})
     merged = _merge_chunk_results(chunk_results, novel_title, char_cache)
 
     # 步骤5：心理占比巡检
+    _emit("refining_psy", {})
     merged = _check_and_refine_psy(merged, client, config)
 
     return merged
@@ -569,17 +677,27 @@ def _parse_chunk_with_retry(
         ScriptYAML | None: 解析成功的剧本数据，失败返回None
 
     Note:
-        失败不抛异常，返回None由上层决定是否继续
+        失败时打印详细错误日志供排查，返回None由上层决定是否继续
     """
+    last_error: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
             ai_output = _call_llm(client, config, system_prompt, user_message)
             yaml_text = _extract_and_repair_yaml(ai_output)
             return ScriptYAML.from_yaml(yaml_text)
-        except Exception:
+        except Exception as e:
+            last_error = e
             if attempt < max_retries:
+                _log(
+                    f"[AI] 分片重试 {attempt + 1}/{max_retries}: "
+                    f"{type(e).__name__}: {str(e)[:200]}"
+                )
                 continue
-            return None
+            # 最终失败，打印完整错误
+            _log(
+                f"[AI] 分片解析最终失败（已重试{max_retries}次）: "
+                f"{type(e).__name__}: {str(e)[:500]}"
+            )
 
     return None
 
@@ -1035,6 +1153,11 @@ def _call_llm(
     """
     调用大语言模型 API 并返回原始文本输出。
 
+    内置 429 速率限制自动退避重试机制：
+    - 检测到 RateLimitError 时按指数退避等待后自动重试
+    - 退避间隔从 5s 开始，每次翻倍，最大 60s
+    - 最多退避重试 3 次（独立于外层 max_retries）
+
     Args:
         client: OpenAI客户端实例
         config: AI配置参数
@@ -1045,20 +1168,43 @@ def _call_llm(
         str: AI 返回的原始文本内容
 
     Raises:
-        RuntimeError: AI 返回空内容时抛出
+        RuntimeError: AI 返回空内容或限流重试耗尽时抛出
     """
-    response = client.chat.completions.create(
-        model=config.model_name,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        temperature=config.temperature,
-        max_tokens=config.max_tokens,
-    )
+    # 导入 openai 的 RateLimitError 用于精确捕获
+    from openai import RateLimitError
 
-    content = response.choices[0].message.content
-    if not content:
-        raise RuntimeError("AI 返回了空内容")
+    for retry in range(RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=config.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=config.temperature,
+                max_tokens=config.max_tokens,
+            )
 
-    return content
+            content = response.choices[0].message.content
+            if not content:
+                raise RuntimeError("AI 返回了空内容")
+
+            return content
+
+        except RateLimitError as e:
+            if retry < RATE_LIMIT_MAX_RETRIES:
+                # 指数退避：5s → 10s → 20s ...
+                wait_time = min(
+                    RATE_LIMIT_BACKOFF_START * (2 ** retry),
+                    RATE_LIMIT_BACKOFF_MAX,
+                )
+                _log(
+                    f"[AI] [429-BACKOFF] 触发 429 速率限制，等待 {wait_time:.0f}s 后重试 "
+                    f"({retry + 1}/{RATE_LIMIT_MAX_RETRIES})"
+                )
+                time.sleep(wait_time)
+                continue
+            else:
+                raise RuntimeError(
+                    f"API 速率限制，已退避重试 {RATE_LIMIT_MAX_RETRIES} 次仍失败: {str(e)[:200]}"
+                ) from e
