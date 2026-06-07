@@ -62,6 +62,14 @@ RATE_LIMIT_BACKOFF_START = 5.0
 RATE_LIMIT_BACKOFF_MAX = 60.0
 # 429 限流最大自动重试次数（独立于 max_retries，专门处理限流）
 RATE_LIMIT_MAX_RETRIES = 3
+# 连接/超时错误退避初始等待时间（秒）
+CONN_BACKOFF_START = 2.0
+# 连接/超时错误退避最大等待时间（秒）
+CONN_BACKOFF_MAX = 30.0
+# 连接/超时错误最大自动重试次数
+CONN_MAX_RETRIES = 3
+# 退避抖动比例（±此比例的随机值，防止多个分片同时重试造成惊群效应)
+BACKOFF_JITTER_RATIO = 0.25
 
 
 def _log(msg: str) -> None:
@@ -1411,12 +1419,32 @@ def _call_llm(
     client: OpenAI, config: AIConfig, system_prompt: str, user_message: str
 ) -> str:
     """
-    调用大语言模型 API 并返回原始文本输出。
+    调用大语言模型 API 并返回原始文本输出（流式接收）。
 
-    内置 429 速率限制自动退避重试机制：
-    - 检测到 RateLimitError 时按指数退避等待后自动重试
-    - 退避间隔从 5s 开始，每次翻倍，最大 60s
-    - 最多退避重试 3 次（独立于外层 max_retries）
+    使用 stream=True 模式逐块接收 LLM 输出，每块实时写入后端日志，
+    便于排查连接中断、内容截断、格式异常等问题。
+
+    内置多层自动重试与退避机制，按错误类型分类处理：
+
+    ┌─────────────────────┬──────────────┬──────────────────────────┐
+    │ 错误类型            │ 退避策略     │ 最大重试次数             │
+    ├─────────────────────┼──────────────┼──────────────────────────┤
+    │ RateLimitError (429)│ 指数退避+抖动 │ RATE_LIMIT_MAX_RETRIES  │
+    │                     │ 5s→10s→20s   │ (默认3次)               │
+    ├─────────────────────┼──────────────┼──────────────────────────┤
+    │ APIConnectionError  │ 指数退避+抖动 │ CONN_MAX_RETRIES        │
+    │ APITimeoutError     │ 2s→4s→8s     │ (默认3次)               │
+    ├─────────────────────┼──────────────┼──────────────────────────┤
+    │ 其他异常            │ 不重试，直接抛出                        │
+    │ (BadRequest/Auth等) │              │                          │
+    └─────────────────────┴──────────────┴──────────────────────────┘
+
+    所有退避均加入 ±25% 随机抖动，防止多个分片同时重试造成惊群效应。
+
+    流式输出日志格式：
+        [AI] [STREAM>>] 首批文本到达...（累计 N 字符）
+        [AI] [STREAM>>] ...后续文本...
+        [AI] [STREAM==] 流式接收完成 | 总计=XXXXB | tokens=p/c/t
 
     Args:
         client: OpenAI客户端实例
@@ -1425,17 +1453,37 @@ def _call_llm(
         user_message: 用户消息
 
     Returns:
-        str: AI 返回的原始文本内容
+        str: AI 返回的完整原始文本内容（所有流式块拼接）
 
     Raises:
-        RuntimeError: AI 返回空内容或限流重试耗尽时抛出
+        RuntimeError: AI 返回空内容、限流/连接重试耗尽时抛出
     """
-    # 导入 openai 的 RateLimitError 用于精确捕获
-    from openai import RateLimitError
+    import random
+    from openai import (
+        APIConnectionError,
+        APITimeoutError,
+        RateLimitError,
+    )
 
-    for retry in range(RATE_LIMIT_MAX_RETRIES + 1):
+    # 预计算请求体大小（用于日志，不随重试变化）
+    sp_len = len(system_prompt.encode("utf-8"))
+    um_len = len(user_message.encode("utf-8"))
+    total_bytes = sp_len + um_len
+
+    # 统一最大重试次数（取两类错误中较大的值）
+    max_retries = max(RATE_LIMIT_MAX_RETRIES, CONN_MAX_RETRIES)
+
+    for retry in range(max_retries + 1):
         try:
-            response = client.chat.completions.create(
+            # === 请求前日志 ===
+            _log(
+                f"[AI] [REQ] 调用 LLM (retry={retry}/{max_retries}) | "
+                f"system_prompt={sp_len}B, user_message={um_len}B, 总计={total_bytes}B | "
+                f"model={config.model_name}, max_tokens={config.max_tokens}, timeout={config.timeout}s"
+            )
+
+            # === 发起流式 API 请求 ===
+            stream = client.chat.completions.create(
                 model=config.model_name,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -1443,28 +1491,137 @@ def _call_llm(
                 ],
                 temperature=config.temperature,
                 max_tokens=config.max_tokens,
+                stream=True,
             )
 
-            content = response.choices[0].message.content
-            if not content:
-                raise RuntimeError("AI 返回了空内容")
+            # === 流式接收：逐块收集并实时打印 ===
+            content_parts: list[str] = []
+            usage_info = None
+            first_chunk_logged = False
 
-            return content
+            for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta is None:
+                    continue
+
+                # 提取本块文本
+                chunk_text = delta.content or ""
+                if not chunk_text:
+                    continue
+
+                content_parts.append(chunk_text)
+
+                # 获取 usage（通常在最后一个 chunk 中返回）
+                if chunk.usage:
+                    usage_info = chunk.usage
+
+                # 实时日志输出
+                current_len = sum(len(p.encode("utf-8")) for p in content_parts)
+                if not first_chunk_logged:
+                    _log(f"[AI] [STREAM>>] 首批数据到达: 「{chunk_text[:80]}{'...' if len(chunk_text) > 80 else ''}」(累计 {current_len}B)")
+                    first_chunk_logged = True
+                else:
+                    # 后续块：截断显示，避免日志刷屏
+                    display = chunk_text[:120].replace("\n", "\\n")
+                    _log(f"[AI] [STREAM>>] {display}{'...' if len(chunk_text) > 120 else ''} ({current_len}B)")
+
+            # === 流结束，拼接完整内容 ===
+            full_content = "".join(content_parts)
+
+            if not full_content:
+                raise RuntimeError("AI 流式返回了空内容")
+
+            resp_len = len(full_content.encode("utf-8"))
+            if usage_info:
+                usage_str = (
+                    f"prompt={usage_info.prompt_tokens}, "
+                    f"completion={usage_info.completion_tokens}, "
+                    f"total={usage_info.total_tokens}"
+                )
+            else:
+                usage_str = "usage=不可用(流式未返回)"
+            _log(
+                f"[AI] [STREAM==] 流式接收完成 | 响应体={resp_len}B | {usage_str}"
+            )
+
+            return full_content
 
         except RateLimitError as e:
-            if retry < RATE_LIMIT_MAX_RETRIES:
-                # 指数退避：5s → 10s → 20s ...
-                wait_time = min(
-                    RATE_LIMIT_BACKOFF_START * (2 ** retry),
-                    RATE_LIMIT_BACKOFF_MAX,
-                )
-                _log(
-                    f"[AI] [429-BACKOFF] 触发 429 速率限制，等待 {wait_time:.0f}s 后重试 "
-                    f"({retry + 1}/{RATE_LIMIT_MAX_RETRIES})"
-                )
-                time.sleep(wait_time)
-                continue
-            else:
+            """429 速率限制：指数退避 + 抖动"""
+            if retry >= RATE_LIMIT_MAX_RETRIES:
                 raise RuntimeError(
-                    f"API 速率限制，已退避重试 {RATE_LIMIT_MAX_RETRIES} 次仍失败: {str(e)[:200]}"
+                    f"API 速率限制(429)，已退避重试 {RATE_LIMIT_MAX_RETRIES} 次仍失败: {str(e)[:200]}"
                 ) from e
+
+            wait_time = _calc_backoff_with_jitter(
+                base=RATE_LIMIT_BACKOFF_START,
+                multiplier=2 ** retry,
+                cap=RATE_LIMIT_BACKOFF_MAX,
+                jitter_ratio=BACKOFF_JITTER_RATIO,
+            )
+            _log(
+                f"[AI] [429-BACKOFF] 触发速率限制，等待 {wait_time:.1f}s 后重试 "
+                f"({retry + 1}/{RATE_LIMIT_MAX_RETRIES})"
+            )
+            time.sleep(wait_time)
+
+        except (APIConnectionError, APITimeoutError) as e:
+            """连接/超时错误：独立退避策略（比429更激进）"""
+            err_type = type(e).__name__
+            if retry >= CONN_MAX_RETRIES:
+                raise RuntimeError(
+                    f"API 连接/超时错误({err_type})，已退避重试 {CONN_MAX_RETRIES} 次仍失败: {str(e)[:200]}"
+                ) from e
+
+            wait_time = _calc_backoff_with_jitter(
+                base=CONN_BACKOFF_START,
+                multiplier=2 ** retry,
+                cap=CONN_BACKOFF_MAX,
+                jitter_ratio=BACKOFF_JITTER_RATIO,
+            )
+            _log(
+                f"[AI] [CONN-BACKOFF] {err_type}: {str(e)[:150]} | "
+                f"等待 {wait_time:.1f}s 后重试 ({retry + 1}/{CONN_MAX_RETRIES}) | "
+                f"请求体约={total_bytes}B"
+            )
+            time.sleep(wait_time)
+
+        except Exception as e:
+            """其他异常（参数错误、认证失败等）：不重试，记录后直接抛出"""
+            err_type = type(e).__name__
+            _log(
+                f"[AI] [ERR] LLM 调用异常（不可重试）| 类型={err_type} | "
+                f"原因={str(e)[:300]} | 请求体约={total_bytes}B"
+            )
+            raise
+
+    # 理论上不会到达此处（所有分支都已 raise 或 return），作为兜底
+    raise RuntimeError(f"LLM 调用在 {max_retries} 次重试后仍未返回有效结果")
+
+
+def _calc_backoff_with_jitter(
+    base: float, multiplier: int, cap: float, jitter_ratio: float
+) -> float:
+    """
+    计算带随机抖动的退避等待时间。
+
+    退避公式：min(base × multiplier, cap) × (1 ± jitter_ratio)
+
+    Args:
+        base: 基础等待时间（秒）
+        multiplier: 指数倍数（通常为 2^retry）
+        cap: 上限等待时间（秒）
+        jitter_ratio: 抖动比例，0.25 表示 ±25% 的随机偏移
+
+    Returns:
+        float: 最终的退避等待时间（秒），始终 ≥ 0
+
+    Example:
+        >>> _calc_backoff_with_jitter(5.0, 2, 60.0, 0.25)  # 可能返回 7.2 ~ 12.8 之间的值
+    """
+    import random
+
+    raw = min(base * multiplier, cap)
+    jitter = random.uniform(-jitter_ratio, jitter_ratio)
+    result = raw * (1 + jitter)
+    return max(result, 0.1)  # 保证至少等待 0.1 秒
