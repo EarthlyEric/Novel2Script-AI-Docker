@@ -125,6 +125,13 @@ const breadcrumbs = computed(() => [
   box-sizing: border-box;
 }
 
+/* 全局隐藏原生滚动条，保留滚动功能 */
+html {
+  scrollbar-width: none; /* Firefox */
+}
+html::-webkit-scrollbar {
+  display: none; /* WebKit */
+}
 body {
   font-family: var(--font-ui);
   background-color: var(--bg-deep);
@@ -132,6 +139,18 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   overflow-x: hidden;
+  scrollbar-width: none; /* Firefox */
+}
+body::-webkit-scrollbar {
+  display: none; /* WebKit */
+}
+
+/* 所有可滚动区域的滚动条统一隐藏 */
+* {
+  scrollbar-width: none !important; /* Firefox */
+}
+*::-webkit-scrollbar {
+  display: none !important; /* WebKit / Chrome / Edge / Safari */
 }
 
 /* Element Plus 暗色覆盖 — 仅覆盖关键组件 */
