@@ -295,7 +295,7 @@ def _parse_single_chunk(
     last_error = None
     for attempt in range(max_retries + 1):
         try:
-            ai_output = _call_llm(client, config, system_prompt, user_message)
+            ai_output = _call_llm(client, config, system_prompt, user_message, progress_callback)
             yaml_text = _extract_and_repair_yaml(ai_output)
             script_data = ScriptYAML.from_yaml(yaml_text)
             # 心理占比巡检
@@ -404,7 +404,7 @@ def _parse_with_chunking(
         # 调用AI（带重试）
         _emit("chunk_start", {"index": chunk_index, "total": total_chunks})
         chunk_result = _parse_chunk_with_retry(
-            system_prompt, user_message, config, client, max_retries
+            system_prompt, user_message, config, client, max_retries, progress_callback=_emit,
         )
         if chunk_result is None:
             _log(f"[AI] [FAIL] 分片 {chunk_index}/{total_chunks} 解析失败，跳过")
@@ -670,6 +670,7 @@ def _parse_chunk_with_retry(
     config: AIConfig,
     client: OpenAI,
     max_retries: int,
+    progress_callback=None,
 ) -> ScriptYAML | None:
     """
     对单个分片执行AI调用，带重试机制。
@@ -680,6 +681,7 @@ def _parse_chunk_with_retry(
         config: AI配置
         client: OpenAI客户端
         max_retries: 最大重试次数
+        progress_callback: 进度回调函数（用于流式输出推送前端）
 
     Returns:
         ScriptYAML | None: 解析成功的剧本数据，失败返回None
@@ -690,7 +692,7 @@ def _parse_chunk_with_retry(
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            ai_output = _call_llm(client, config, system_prompt, user_message)
+            ai_output = _call_llm(client, config, system_prompt, user_message, progress_callback)
             yaml_text = _extract_and_repair_yaml(ai_output)
             return ScriptYAML.from_yaml(yaml_text)
         except Exception as e:
@@ -1416,13 +1418,17 @@ def _build_user_message(novel_text: str, novel_title: str) -> str:
 
 
 def _call_llm(
-    client: OpenAI, config: AIConfig, system_prompt: str, user_message: str
+    client: OpenAI,
+    config: AIConfig,
+    system_prompt: str,
+    user_message: str,
+    progress_callback=None,
 ) -> str:
     """
     调用大语言模型 API 并返回原始文本输出（流式接收）。
 
     使用 stream=True 模式逐块接收 LLM 输出，每块实时写入后端日志，
-    便于排查连接中断、内容截断、格式异常等问题。
+    同时通过 progress_callback 发送 stream_chunk 事件供前端展示。
 
     内置多层自动重试与退避机制，按错误类型分类处理：
 
@@ -1441,16 +1447,21 @@ def _call_llm(
 
     所有退避均加入 ±25% 随机抖动，防止多个分片同时重试造成惊群效应。
 
-    流式输出日志格式：
-        [AI] [STREAM>>] 首批文本到达...（累计 N 字符）
-        [AI] [STREAM>>] ...后续文本...
+    流式输出日志格式（后端终端）：
+        [AI] [STREAM>>] 首批数据到达...（累计 N 字符）
         [AI] [STREAM==] 流式接收完成 | 总计=XXXXB | tokens=p/c/t
+
+    进度回调事件（前端面板）：
+        stream_start   → 标记开始流式接收
+        stream_chunk   → 每块文本内容（带累计长度）
+        stream_done    → 流式结束（带总长度和 token 用量）
 
     Args:
         client: OpenAI客户端实例
         config: AI配置参数
         system_prompt: 系统提示词
         user_message: 用户消息
+        progress_callback: 可选的进度回调函数，签名为 callback(event_type, data)
 
     Returns:
         str: AI 返回的完整原始文本内容（所有流式块拼接）
@@ -1473,6 +1484,14 @@ def _call_llm(
     # 统一最大重试次数（取两类错误中较大的值）
     max_retries = max(RATE_LIMIT_MAX_RETRIES, CONN_MAX_RETRIES)
 
+    # 进度回调辅助函数（安全调用，忽略异常）
+    def _emit_cb(event_type: str, data: dict | None = None) -> None:
+        if progress_callback:
+            try:
+                progress_callback(event_type, data or {})
+            except Exception:
+                pass
+
     for retry in range(max_retries + 1):
         try:
             # === 请求前日志 ===
@@ -1494,10 +1513,12 @@ def _call_llm(
                 stream=True,
             )
 
-            # === 流式接收：逐块收集并实时打印 ===
+            # === 流式接收：逐块收集并实时打印/推送前端 ===
             content_parts: list[str] = []
             usage_info = None
             first_chunk_logged = False
+
+            _emit_cb("stream_start", {})
 
             for chunk in stream:
                 delta = chunk.choices[0].delta if chunk.choices else None
@@ -1515,7 +1536,7 @@ def _call_llm(
                 if chunk.usage:
                     usage_info = chunk.usage
 
-                # 实时日志输出
+                # 实时日志输出（后端终端）
                 current_len = sum(len(p.encode("utf-8")) for p in content_parts)
                 if not first_chunk_logged:
                     _log(f"[AI] [STREAM>>] 首批数据到达: 「{chunk_text[:80]}{'...' if len(chunk_text) > 80 else ''}」(累计 {current_len}B)")
@@ -1525,6 +1546,12 @@ def _call_llm(
                     display = chunk_text[:120].replace("\n", "\\n")
                     _log(f"[AI] [STREAM>>] {display}{'...' if len(chunk_text) > 120 else ''} ({current_len}B)")
 
+                # 推送流式文本到前端进度面板
+                _emit_cb("stream_chunk", {
+                    "text": chunk_text,
+                    "accumulated_length": current_len,
+                })
+
             # === 流结束，拼接完整内容 ===
             full_content = "".join(content_parts)
 
@@ -1532,17 +1559,28 @@ def _call_llm(
                 raise RuntimeError("AI 流式返回了空内容")
 
             resp_len = len(full_content.encode("utf-8"))
+            usage_data = {}
             if usage_info:
                 usage_str = (
                     f"prompt={usage_info.prompt_tokens}, "
                     f"completion={usage_info.completion_tokens}, "
                     f"total={usage_info.total_tokens}"
                 )
+                usage_data = {
+                    "prompt_tokens": usage_info.prompt_tokens,
+                    "completion_tokens": usage_info.completion_tokens,
+                    "total_tokens": usage_info.total_tokens,
+                }
             else:
                 usage_str = "usage=不可用(流式未返回)"
             _log(
                 f"[AI] [STREAM==] 流式接收完成 | 响应体={resp_len}B | {usage_str}"
             )
+
+            _emit_cb("stream_done", {
+                "response_length": resp_len,
+                **usage_data,
+            })
 
             return full_content
 

@@ -231,7 +231,7 @@
 
           <!-- 流式进度面板 -->
           <transition name="progress-fade">
-            <div v-if="converting && progressLogs.length > 0" class="progress-panel">
+            <div v-if="converting && (progressLogs.length > 0 || isStreaming)" class="progress-panel">
               <!-- 进度条 -->
               <div class="progress-bar-track" v-if="totalChunks > 0">
                 <div
@@ -239,6 +239,15 @@
                   :style="{ width: progressPercent + '%' }"
                 ></div>
                 <span class="progress-bar-text">{{ completedChunks }}/{{ totalChunks }} 分片</span>
+              </div>
+
+              <!-- 流式输出区域（LLM 实时返回内容） -->
+              <div v-if="isStreaming || streamText" class="stream-output">
+                <div class="stream-header">
+                  <span class="stream-label">AI 输出</span>
+                  <span class="stream-stats">{{ streamLength }}B{{ streamTokens ? ' | ' + streamTokens + ' tokens' : '' }}</span>
+                </div>
+                <pre class="stream-body" ref="streamBodyRef"><code v-html="highlightedStreamText"></code></pre>
               </div>
 
               <!-- 实时日志 -->
@@ -272,7 +281,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, nextTick, onUnmounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, nextTick, onUnmounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { convertNovelStream, testConnection } from '@/api/script'
@@ -299,8 +308,32 @@ const currentStage = ref('')
 const totalChunks = ref(0)
 const completedChunks = ref(0)
 const elapsedSeconds = ref(0)
+// 流式输出相关状态
+const isStreaming = ref(false)
+const streamText = ref('')
+const streamTokens = ref('')
 let abortController: AbortController | null = null
 let elapsedTimer: ReturnType<typeof setInterval> | null = null
+const streamBodyRef = ref<HTMLElement | null>(null)
+
+/** 流式文本累计字节数 */
+const streamLength = computed(() => new TextEncoder().encode(streamText.value).length)
+
+/** 流式文本语法高亮（YAML key/value 着色） */
+const highlightedStreamText = computed(() => {
+  const text = streamText.value
+  if (!text) return ''
+  // 转义 HTML 特殊字符
+  const escaped = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+  // YAML key: value 着色（冒号前的键名 + 冒号 → 青色，值保持白色）
+  return escaped.replace(
+    /^(\s*)([\w\u4e00-\u9fff_][\w\s\-\/\u4e00-\u9fff_]*)(\s*:\s*)/gm,
+    '$1<span class="st-key">$2</span><span class="st-colon">$3</span>'
+  )
+})
 
 /** 启动已用时间计时器 */
 function startElapsedTimer() {
@@ -630,6 +663,39 @@ function handleProgressEvent(event: { stage: string; message: string; data: Reco
   const { stage, message, data } = event
   currentStage.value = message
 
+  // === 流式输出事件处理 ===
+  if (stage === 'stream_start') {
+    isStreaming.value = true
+    streamText.value = ''
+    streamTokens.value = ''
+    addLog('streaming', '[流式] 等待模型响应...')
+    return // 不走通用日志流程
+  }
+
+  if (stage === 'stream_chunk') {
+    const chunkText = data.text as string || ''
+    if (chunkText) {
+      streamText.value += chunkText
+      // 自动滚动到流式输出底部
+      nextTick(() => {
+        if (streamBodyRef.value) {
+          streamBodyRef.value.scrollTop = streamBodyRef.value.scrollHeight
+        }
+      })
+    }
+    currentStage.value = `[流式] 接收中... (${streamLength.value}B)`
+    return // 不走通用日志流程（避免刷屏）
+  }
+
+  if (stage === 'stream_done') {
+    isStreaming.value = false
+    const totalTokens = data.total_tokens as number | undefined
+    streamTokens.value = totalTokens ? String(totalTokens) : ''
+    addLog('stream_done', `[流式完成] ${streamLength.value}B${totalTokens ? ' | ' + totalTokens + ' tokens' : ''}`)
+    return
+  }
+
+  // === 常规进度事件处理 ===
   // 更新分片进度
   if (stage === 'chunks_ready' && data.total) {
     totalChunks.value = data.total as number
@@ -1313,4 +1379,60 @@ onUnmounted(() => {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
 }
+
+/* ========== 流式输出区域（AI 实时返回内容）========== */
+.stream-output {
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.stream-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 12px;
+  background: rgba(56, 189, 248, 0.08);
+  border-bottom: 1px solid rgba(56, 189, 248, 0.15);
+}
+.stream-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #38bdf8;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.stream-stats {
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.stream-body {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 200px;
+  overflow-y: auto;
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  color: #e2e8f0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-color) transparent;
+}
+.stream-body::-webkit-scrollbar { width: 4px; }
+.stream-body::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 2px; }
+/* 流式输出语法高亮 */
+.st-key {
+  color: #38bdf8;   /* 青色 - YAML 键名 */
+  font-weight: 500;
+}
+.st-colon {
+  color: #f472b6;   /* 粉色 - 冒号分隔符 */
+}
+
+/* 流式阶段日志颜色 */
+.log-streaming .log-msg { color: #38bdf8; }
+.log-stream_done .log-msg { color: #4ade80; font-weight: 500; }
 </style>
