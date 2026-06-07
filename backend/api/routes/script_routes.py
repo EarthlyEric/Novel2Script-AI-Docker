@@ -2,16 +2,19 @@
 剧本转换 API 路由模块
 
 提供小说转剧本的核心 HTTP 接口，包括：
-- POST /api/script/convert   — 小说文本转换为结构化YAML剧本
+- POST /api/script/convert        — 小说文本转换为结构化YAML剧本（同步）
+- POST /api/script/convert-stream — 小说文本转换为结构化YAML剧本（SSE流式）
 - POST /api/script/test-connection — 测试LLM模型连通性
-- GET  /api/script/schema    — 获取 YAML Schema 规范说明
-- POST /api/script/validate  — 校验 YAML 内容是否符合 Schema
+- GET  /api/script/schema         — 获取 YAML Schema 规范说明
+- POST /api/script/validate       — 校验 YAML 内容是否符合 Schema
 """
 
+import json
 import sys
 import time
 
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException
+from fastapi.responses import StreamingResponse
 
 from backend.config import AIConfig
 from backend.schemas.script_schema import (
@@ -140,6 +143,211 @@ async def convert_novel_to_script(
         err_str = str(e)
         log(f"[CONVERT] 异常({err_type}): {err_str[:500]}")
         raise HTTPException(status_code=500, detail=f"服务器内部错误 [{err_type}]: {err_str[:300]}")
+
+
+@router.post("/convert-stream")
+async def convert_novel_to_script_stream(
+    novel_title: str = Form(..., description="小说/原著名称"),
+    novel_text: str = Form(default="", description="小说正文文本"),
+    novel_file: UploadFile | None = File(None, description="上传的文本文件"),
+    api_key: str = Form(default="", description="可选：自定义API Key"),
+    base_url: str = Form(default="", description="可选：自定义API地址"),
+    model_name: str = Form(default="", description="可选：自定义模型名称"),
+):
+    """
+    SSE 流式转换接口 — 实时推送解析进度。
+
+    返回 text/event-stream 格式，前端可通过 fetch ReadableStream 或 EventSource 接收。
+    事件类型：
+      - progress: 进度更新（含 stage/message/data）
+      - result:   转换完成（含完整 data 和 yaml_text）
+      - error:    错误信息
+    """
+    import asyncio
+
+    def _sse_event(event: str, data: dict) -> str:
+        """构造 SSE 格式事件行"""
+        return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    async def event_generator():
+        """异步生成器，逐步产出 SSE 事件"""
+        try:
+            # ---- 步骤1：获取原始文本 ----
+            raw_text = ""
+            if novel_file and novel_file.filename:
+                content = await novel_file.read()
+                raw_text = content.decode("utf-8", errors="ignore")
+                log(f"[STREAM] 收到文件上传: {novel_file.filename}, 大小: {len(content)} 字节")
+            elif novel_text and novel_text.strip():
+                raw_text = novel_text.strip()
+                log(f"[STREAM] 收到文本粘贴: {len(raw_text)} 字符")
+            else:
+                yield _sse_event("error", {"message": "请提供小说正文文本或上传文件"})
+                return
+
+            # 发送初始进度
+            yield _sse_event("progress", {
+                "stage": "preprocessing",
+                "message": f"正在预处理文本（{len(raw_text)} 字符）...",
+                "data": {"text_length": len(raw_text)},
+            })
+
+            # ---- 步骤2：文本预处理 ----
+            log(f"[STREAM] 开始预处理，输入长度: {len(raw_text)} 字符")
+            preprocess_result = preprocess_novel_text(raw_text)
+            log(f"[STREAM] 预处理完成: 章节范围={preprocess_result.chapter_range}")
+            yield _sse_event("progress", {
+                "stage": "preprocessed",
+                "message": f"预处理完成，章节范围: {preprocess_result.chapter_range}",
+                "data": {
+                    "chapter_range": preprocess_result.chapter_range,
+                    "output_length": len(preprocess_result.clean_text),
+                },
+            })
+
+            # ---- 步骤3：构建AI配置 ----
+            config = AIConfig(
+                api_key=api_key or "",
+                base_url=base_url or "",
+                model_name=model_name or "",
+            )
+            log(f"[STREAM] AI配置: model={config.model_name}")
+
+            # ---- 步骤4：AI解析（带进度回调） ----
+            final_result = [None]
+            final_error = [None]
+
+            def on_progress(event_type: str, data: dict) -> None:
+                """
+                AI 解析服务的进度回调。
+                将同步回调转换为 async queue 消息供 event_generator 消费。
+                """
+                stage_map = {
+                    "start": ("parsing", f"开始AI解析... (文本长度: {data.get('text_length', '?')} 字)"),
+                    "parsing_single": ("calling_llm", "正在调用 AI 模型进行单次解析..."),
+                    "parsing_chunks": ("parsing_chunks", f"进入分片模式（{data.get('text_length', '?')} 字符）"),
+                    "extracting_chars": ("extracting_chars", "正在预提取人物信息..."),
+                    "chars_extracted": ("chars_extracted",
+                                        f"人物提取完成，共 {data.get('char_count', 0)} 个角色"),
+                    "chunking": ("chunking", "正在切割文本为分片..."),
+                    "chunks_ready": ("chunks_ready",
+                                     f"文本已切割为 {data.get('total', 0)} 个分片"),
+                    "chunk_wait": ("waiting",
+                                    f"等待速率限制冷却 ({data.get('wait_seconds', 2)}s)..."),
+                    "chunk_start": ("chunk_start",
+                                    f"正在解析第 {data.get('index', '?')}/{data.get('total', '?')} 片..."),
+                    "chunk_done": ("chunk_done",
+                                   f"第 {data.get('index', '?')}/{data.get('total', '?')} 片解析完成 "
+                                   f"(+{data.get('scenes', 0)} 场戏)"),
+                    "chunk_fail": ("chunk_fail",
+                                   f"第 {data.get('index', '?')}/{data.get('total', '?')} 片解析失败，跳过"),
+                    "merging": ("merging",
+                                f"正在合并 {data.get('completed_chunks', 0)}/{data.get('total_chunks', 0)} 个分片结果..."),
+                    "refining_psy": ("refining_psy", "正在进行心理占比巡检与精简..."),
+                    "done": ("done", "解析完成!"),
+                    "error": ("error", data.get("message", "未知错误")),
+                }
+                stage, msg = stage_map.get(event_type, ("unknown", str(data)))
+                # 将结果存入共享变量
+                if event_type == "done":
+                    final_result[0] = data
+                elif event_type == "error":
+                    final_error[0] = data
+
+                # 使用线程安全的方式传递事件到异步生成器
+                nonlocal _pending_events
+                _pending_events.append({
+                    "stage": stage,
+                    "message": msg,
+                    "data": data,
+                })
+
+            # 用于在线程和协程之间传递事件的列表
+            _pending_events: list[dict] = []
+
+            # 在线程池中运行同步的 AI 解析（避免阻塞事件循环）
+            loop = asyncio.get_event_loop()
+
+            def run_parse():
+                try:
+                    script_data = parse_novel_to_script(
+                        novel_text=preprocess_result.clean_text,
+                        novel_title=novel_title,
+                        config=config,
+                        progress_callback=on_progress,
+                    )
+                    # 更新章节范围
+                    script_data.script_meta.chapter_range = preprocess_result.chapter_range
+                    # 渲染 YAML
+                    yaml_text = render_script_yaml(script_data)
+                    final_result[0] = {
+                        "scenes": len(script_data.script_scenes),
+                        "characters": len(script_data.global_characters),
+                        "script_data": script_data.model_dump(mode="python"),
+                        "yaml_text": yaml_text,
+                    }
+                except Exception as e:
+                    final_error[0] = {"type": type(e).__name__, "message": str(e)[:500]}
+                    _pending_events.append({
+                        "stage": "error",
+                        "message": f"解析异常: [{type(e).__name__}] {str(e)[:200]}",
+                        "data": {"type": type(e).__name__, "message": str(e)[:300]},
+                    })
+
+            # 启动后台任务
+            parse_task = loop.run_in_executor(None, run_parse)
+
+            # 轮询 pending_events 并发送给客户端
+            last_tick = time.time()
+            while not parse_task.done() or _pending_events:
+                if _pending_events:
+                    evt = _pending_events.pop(0)
+                    yield _sse_event("progress", evt)
+                    last_tick = time.time()
+
+                if parse_task.done():
+                    # 任务完成，发送剩余事件
+                    while _pending_events:
+                        evt = _pending_events.pop(0)
+                        yield _sse_event("progress", evt)
+                    break
+
+                # 每 0.5s 轮询一次，避免忙等待
+                await asyncio.sleep(0.5)
+
+                # 心跳：每 15s 发一次 keepalive 防止超时
+                if time.time() - last_tick > 15:
+                    yield _sse_event("heartbeat", {})
+                    last_tick = time.time()
+
+            # 等待任务完成确保无遗漏
+            await parse_task
+
+            # 发送最终结果或错误
+            if final_error[0]:
+                yield _sse_event("error", final_error[0])
+            elif final_result[0]:
+                yield _sse_event("result", final_result[0])
+            else:
+                yield _sse_event("error", {"message": "未获取到解析结果"})
+
+        except Exception as e:
+            err_type = type(e).__name__
+            log(f"[STREAM] 异常({err_type}): {str(e)[:500]}")
+            yield _sse_event("error", {
+                "type": err_type,
+                "message": f"服务器内部错误: {str(e)[:300]}",
+            })
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/test-connection")

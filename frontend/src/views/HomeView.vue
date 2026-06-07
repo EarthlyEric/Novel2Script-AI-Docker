@@ -215,10 +215,51 @@
               </span>
               <span v-else class="btn-loading">
                 <span class="spinner"></span>
-                AI 正在解析中...
+                {{ currentStage || 'AI 正在解析中...' }}
               </span>
             </button>
+
+            <!-- 取消按钮（转换进行中时显示） -->
+            <button
+              v-if="converting"
+              class="cancel-btn"
+              @click="handleCancelConvert"
+            >
+              取消转换
+            </button>
           </div>
+
+          <!-- 流式进度面板 -->
+          <transition name="progress-fade">
+            <div v-if="converting && progressLogs.length > 0" class="progress-panel">
+              <!-- 进度条 -->
+              <div class="progress-bar-track" v-if="totalChunks > 0">
+                <div
+                  class="progress-bar-fill"
+                  :style="{ width: progressPercent + '%' }"
+                ></div>
+                <span class="progress-bar-text">{{ completedChunks }}/{{ totalChunks }} 分片</span>
+              </div>
+
+              <!-- 实时日志 -->
+              <div ref="logContainerRef" class="log-container">
+                <div
+                  v-for="(log, idx) in progressLogs"
+                  :key="idx"
+                  class="log-line"
+                  :class="'log-' + log.stage"
+                >
+                  <span class="log-time">{{ log.time }}</span>
+                  <span class="log-msg">{{ log.message }}</span>
+                  <span v-if="log.extra" class="log-extra">{{ log.extra }}</span>
+                </div>
+                <div class="log-line log-active">
+                  <span class="log-time">{{ getCurrentTime() }}</span>
+                  <span class="log-msg log-blink">处理中...</span>
+                </div>
+              </div>
+            </div>
+          </transition>
         </el-form>
       </div>
     </section>
@@ -226,19 +267,33 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive } from 'vue'
+import { ref, reactive, nextTick, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
-import { convertNovel, testConnection } from '@/api/script'
+import { convertNovelStream, testConnection } from '@/api/script'
 import JSZip from 'jszip'
 
 const router = useRouter()
 const formRef = ref<FormInstance>()
 const uploadRef = ref()
+const logContainerRef = ref<HTMLElement | null>(null)
 const inputMode = ref<'text' | 'file'>('text')
 const converting = ref(false)
 const testingConn = ref(false)
 const connResult = ref<{ success: boolean; message: string; latency_ms?: number } | null>(null)
+
+// 流式进度相关状态
+interface ProgressLog {
+  time: string
+  stage: string
+  message: string
+  extra?: string
+}
+const progressLogs = ref<ProgressLog[]>([])
+const currentStage = ref('')
+const totalChunks = ref(0)
+const completedChunks = ref(0)
+let abortController: AbortController | null = null
 
 const form = reactive({
   novel_title: '',
@@ -482,17 +537,34 @@ async function handleSubmit() {
   }
 
   converting.value = true
+  progressLogs.value = []
+  totalChunks.value = 0
+  completedChunks.value = 0
+
+  // 创建 AbortController 用于取消请求
+  abortController = new AbortController()
+
+  // 添加首条日志
+  addLog('start', '提交转换请求...')
 
   try {
-    const result = await convertNovel({
-      novel_title: form.novel_title,
-      novel_text: form.novel_text,
-      api_key: form.api_key || undefined,
-      base_url: form.base_url || undefined,
-      model_name: form.model_name || undefined,
-    })
+    const result = await convertNovelStream(
+      {
+        novel_title: form.novel_title,
+        novel_text: form.novel_text,
+        api_key: form.api_key || undefined,
+        base_url: form.base_url || undefined,
+        model_name: form.model_name || undefined,
+      },
+      // 进度回调
+      (event) => {
+        handleProgressEvent(event)
+      },
+      abortController.signal,
+    )
 
     if (result.success && result.data) {
+      addLog('done', `转换完成！共 ${result.message}`)
       sessionStorage.setItem('script_data', JSON.stringify(result.data))
       sessionStorage.setItem('yaml_text', result.yaml_text || '')
       ElMessage.success(result.message)
@@ -503,7 +575,10 @@ async function handleSubmit() {
   } catch (error: any) {
     // 区分不同错误类型给出明确提示
     let msg = error.message || '转换请求失败'
-    if (error.code === 'ECONNABORTED' || msg.includes('timeout')) {
+    if (error.name === 'AbortError') {
+      msg = '用户取消了转换'
+      addLog('cancelled', msg)
+    } else if (msg.includes('timeout') || error.code === 'ECONNABORTED') {
       msg = '转换超时：文本较长时处理时间可能超过10分钟，请尝试缩短文本或使用更快的模型'
     } else if (msg.includes('429') || msg.includes('rate_limit')) {
       msg = 'API 频率限制：请求过于频繁，请稍后再试'
@@ -512,11 +587,96 @@ async function handleSubmit() {
     } else if (msg.includes('400') && msg.includes('模型')) {
       msg = '模型不支持：当前模型名不被该 API 平台支持，请先测试连接确认'
     }
+    addLog('error', msg)
     ElMessage.error(msg)
   } finally {
     converting.value = false
+    abortController = null
   }
 }
+
+/**
+ * 处理流式进度事件，更新UI状态和日志
+ * @param event - 后端推送的进度事件对象
+ */
+function handleProgressEvent(event: { stage: string; message: string; data: Record<string, unknown> }) {
+  const { stage, message, data } = event
+  currentStage.value = message
+
+  // 更新分片进度
+  if (stage === 'chunks_ready' && data.total) {
+    totalChunks.value = data.total as number
+  }
+  if (stage === 'chunk_done' && data.completed) {
+    completedChunks.value = data.completed as number
+  }
+
+  // 构建额外信息
+  let extra = ''
+  if (stage === 'chunk_done' && data.scenes) {
+    extra = `(+${data.scenes} 场)`
+  }
+  if (stage === 'chars_extracted' && data.char_count) {
+    extra = `${data.char_count} 个角色`
+  }
+
+  addLog(stage, message, extra)
+
+  // 自动滚动到底部
+  nextTick(() => {
+    if (logContainerRef.value) {
+      logContainerRef.value.scrollTop = logContainerRef.value.scrollHeight
+    }
+  })
+}
+
+/**
+ * 添加一条进度日志
+ * @param stage - 阶段标识
+ * @param message - 日志消息
+ * @param extra - 额外信息（可选）
+ */
+function addLog(stage: string, message: string, extra?: string) {
+  progressLogs.value.push({
+    time: getCurrentTime(),
+    stage,
+    message,
+    extra,
+  })
+  // 限制日志数量，防止内存溢出（保留最近200条）
+  if (progressLogs.value.length > 200) {
+    progressLogs.value = progressLogs.value.slice(-150)
+  }
+}
+
+/** 获取当前时间字符串 HH:MM:SS */
+function getCurrentTime(): string {
+  const now = new Date()
+  return [now.getHours(), now.getMinutes(), now.getSeconds()]
+    .map((n) => String(n).padStart(2, '0'))
+    .join(':')
+}
+
+/** 进度条百分比 */
+const progressPercent = (): number => {
+  if (totalChunks.value <= 0) return 0
+  return Math.round((completedChunks.value / totalChunks.value) * 100)
+}
+
+/** 取消正在进行的转换 */
+function handleCancelConvert() {
+  if (abortController) {
+    abortController.abort()
+    addLog('cancelled', '用户取消转换请求')
+  }
+}
+
+// 组件卸载时清理
+onUnmounted(() => {
+  if (abortController) {
+    abortController.abort()
+  }
+})
 </script>
 
 <style scoped>
@@ -972,5 +1132,146 @@ async function handleSubmit() {
   margin-left: 6px;
   opacity: 0.7;
   font-weight: 400;
+}
+
+/* ====== 流式进度面板 ====== */
+.cancel-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 20px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.25s;
+}
+.cancel-btn:hover {
+  border-color: #f87171;
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.progress-panel {
+  margin-top: 20px;
+  padding: 16px 18px;
+  background: rgba(201, 162, 39, 0.04);
+  border: 1px solid rgba(201, 162, 39, 0.15);
+  border-radius: var(--radius-md);
+  animation: panelSlideIn 0.4s var(--ease-out) both;
+}
+
+@keyframes panelSlideIn {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.progress-fade-enter-active { transition: all 0.4s var(--ease-out); }
+.progress-fade-leave-active { transition: all 0.3s ease-in; }
+.progress-fade-enter-from { opacity: 0; transform: translateY(10px); }
+.progress-fade-leave-to { opacity: 0; }
+
+/* 进度条 */
+.progress-bar-track {
+  position: relative;
+  height: 6px;
+  background: var(--bg-elevated);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+.progress-bar-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-light));
+  border-radius: 3px;
+  transition: width 0.5s ease;
+  box-shadow: 0 0 8px var(--accent-glow);
+}
+.progress-bar-text {
+  position: absolute;
+  right: 0;
+  top: -20px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.5px;
+}
+
+/* 日志容器 */
+.log-container {
+  max-height: 240px;
+  overflow-y: auto;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 6px;
+  padding: 10px 12px;
+  /* 自定义滚动条 */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-color) transparent;
+}
+.log-container::-webkit-scrollbar { width: 4px; }
+.log-container::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 2px; }
+
+.log-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+  line-height: 1.6;
+  animation: logFadeIn 0.25s ease both;
+}
+@keyframes logFadeIn {
+  from { opacity: 0; transform: translateX(-6px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.log-time {
+  flex-shrink: 0;
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+  font-size: 10px;
+  color: var(--text-muted);
+  opacity: 0.7;
+  min-width: 48px;
+}
+.log-msg {
+  color: var(--text-secondary);
+}
+.log-extra {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--accent-dim);
+  font-weight: 500;
+}
+
+/* 各阶段颜色 */
+.log-preprocessing .log-msg,
+.log-parsed .log-msg,
+.log-calling_llm .log-msg,
+.log-chunking .log-msg,
+.log-extracting_chars .log-msg { color: var(--text-secondary); }
+.log-preprocessed .log-msg,
+.log-chars_extracted .log-msg,
+.log-chunks_ready .log-msg { color: #60a5fa; }
+.log-chunk_start .log-msg,
+.log-waiting .log-msg { color: var(--accent); }
+.log-chunk_done .log-msg { color: #4ade80; }
+.log-chunk_fail .log-msg { color: #fb923c; }
+.log-merging .log-msg,
+.log-refining_psy .log-msg { color: #c084fc; }
+.log-done .log-msg { color: #4ade80; font-weight: 600; }
+.log-error .log-msg,
+.log-cancelled .log-msg { color: #f87171; font-weight: 500; }
+
+.log-blink {
+  animation: blink 1.2s ease infinite;
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }
 </style>

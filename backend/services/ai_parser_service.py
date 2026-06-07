@@ -197,6 +197,17 @@ def parse_novel_to_script(
     if not config.api_key:
         raise ValueError("API Key 未配置，请在设置中填写有效的 API Key")
 
+    # 进度回调辅助函数
+    def _emit(event_type: str, data: dict | None = None) -> None:
+        """安全调用进度回调，忽略异常"""
+        if progress_callback:
+            try:
+                progress_callback(event_type, data or {})
+            except Exception:
+                pass
+
+    _emit("start", {"text_length": len(novel_text), "novel_title": novel_title})
+
     # 初始化 OpenAI 客户端
     client = OpenAI(
         base_url=config.base_url,
@@ -208,12 +219,28 @@ def parse_novel_to_script(
 
     # 短文本：直接单次调用
     if text_length <= CHUNK_SIZE:
-        return _parse_single_chunk(novel_text, novel_title, config, client, max_retries)
+        _emit("parsing_single", {"text_length": text_length})
+        result = _parse_single_chunk(
+            novel_text, novel_title, config, client, max_retries, progress_callback
+        )
+        _emit("done", {
+            "scenes": len(result.script_scenes),
+            "characters": len(result.global_characters),
+        })
+        return result
 
     # 长文本：分片处理流程
     _log(f"[AI] 文本长度 {text_length} 字，进入分片处理模式（阈值: {CHUNK_SIZE}）")
     _log(f"[AI] AI配置: model={config.model_name}, base_url={config.base_url}, api_key={'***' if config.api_key else '(空)'}")
-    return _parse_with_chunking(novel_text, novel_title, config, client, max_retries)
+    _emit("parsing_chunks", {"text_length": text_length})
+    result = _parse_with_chunking(
+        novel_text, novel_title, config, client, max_retries, progress_callback
+    )
+    _emit("done", {
+        "scenes": len(result.script_scenes),
+        "characters": len(result.global_characters),
+    })
+    return result
 
 
 # ============================================================
@@ -227,6 +254,7 @@ def _parse_single_chunk(
     config: AIConfig,
     client: OpenAI,
     max_retries: int,
+    progress_callback=None,
 ) -> ScriptYAML:
     """
     短文本单次调用路径，无需分片。
@@ -237,6 +265,7 @@ def _parse_single_chunk(
         config: AI配置
         client: OpenAI客户端
         max_retries: 最大重试次数
+        progress_callback: 进度回调函数
 
     Returns:
         ScriptYAML: 结构化剧本数据
@@ -244,6 +273,14 @@ def _parse_single_chunk(
     Raises:
         RuntimeError: AI解析失败且重试耗尽时抛出
     """
+    def _emit(event_type: str, data: dict | None = None) -> None:
+        if progress_callback:
+            try:
+                progress_callback(event_type, data or {})
+            except Exception:
+                pass
+
+    _emit("calling_llm", {"mode": "single", "retries": max_retries})
     system_prompt = _load_prompt("system_prompt.txt")
     user_message = _build_user_message(novel_text, novel_title)
 
@@ -278,6 +315,7 @@ def _parse_with_chunking(
     config: AIConfig,
     client: OpenAI,
     max_retries: int,
+    progress_callback=None,
 ) -> ScriptYAML:
     """
     长文本分片处理主流程。
@@ -295,6 +333,7 @@ def _parse_with_chunking(
         config: AI配置
         client: OpenAI客户端
         max_retries: 最大重试次数
+        progress_callback: 进度回调函数
 
     Returns:
         ScriptYAML: 合并后的完整结构化剧本数据
@@ -302,12 +341,24 @@ def _parse_with_chunking(
     Raises:
         RuntimeError: 所有分片均解析失败时抛出
     """
+    def _emit(event_type: str, data: dict | None = None) -> None:
+        if progress_callback:
+            try:
+                progress_callback(event_type, data or {})
+            except Exception:
+                pass
+
     # 步骤1：前置人物预提取
+    _emit("extracting_chars", {})
     char_cache = _extract_characters(novel_text, client, config)
+    _emit("chars_extracted", {"char_count": len(char_cache.get_all_names())})
 
     # 步骤2：滑动分片
+    _emit("chunking", {"text_length": len(novel_text)})
     chunks = _split_into_chunks(novel_text)
-    _log(f"[AI] 共切割为 {len(chunks)} 个分片")
+    total_chunks = len(chunks)
+    _log(f"[AI] 共切割为 {total_chunks} 个分片")
+    _emit("chunks_ready", {"total": total_chunks})
 
     # 步骤3：逐片AI转换
     chunk_results: list[ScriptYAML] = []
@@ -339,17 +390,25 @@ def _parse_with_chunking(
         # 调用AI前等待，避免连续请求触发速率限制
         if i > 0:
             _log(f"[AI] [WAIT] 等待 {CHUNK_CALL_INTERVAL}s 后处理分片 {chunk_index}/{total_chunks} ...")
+            _emit("chunk_wait", {"index": chunk_index, "total": total_chunks, "wait_seconds": CHUNK_CALL_INTERVAL})
             time.sleep(CHUNK_CALL_INTERVAL)
 
         # 调用AI（带重试）
+        _emit("chunk_start", {"index": chunk_index, "total": total_chunks})
         chunk_result = _parse_chunk_with_retry(
             system_prompt, user_message, config, client, max_retries
         )
         if chunk_result is None:
             _log(f"[AI] [FAIL] 分片 {chunk_index}/{total_chunks} 解析失败，跳过")
+            _emit("chunk_fail", {"index": chunk_index, "total": total_chunks})
             continue
 
-        _log(f"[AI] [OK] 分片 {chunk_index}/{total_chunks} 解析成功（{len(chunk_result.script_scenes)} 场戏）")
+        scene_count = len(chunk_result.script_scenes)
+        _log(f"[AI] [OK] 分片 {chunk_index}/{total_chunks} 解析成功（{scene_count} 场戏）")
+        _emit("chunk_done", {
+            "index": chunk_index, "total": total_chunks, "scenes": scene_count,
+            "completed": len(chunk_results) + 1,
+        })
         chunk_results.append(chunk_result)
 
         # 提取摘要锚点
@@ -358,6 +417,7 @@ def _parse_with_chunking(
         id_offset = _calc_next_id_offset(chunk_result, id_offset)
 
     if not chunk_results:
+        _emit("error", {"message": "所有分片解析均失败"})
         raise RuntimeError(
             f"所有分片解析均失败，无法生成剧本（共 {len(chunks)} 个分片）。"
             f"请检查：1) API Key / Base URL 是否正确 2) 模型名称是否有效 "
@@ -365,9 +425,11 @@ def _parse_with_chunking(
         )
 
     # 步骤4：后端汇总合并
+    _emit("merging", {"completed_chunks": len(chunk_results), "total_chunks": total_chunks})
     merged = _merge_chunk_results(chunk_results, novel_title, char_cache)
 
     # 步骤5：心理占比巡检
+    _emit("refining_psy", {})
     merged = _check_and_refine_psy(merged, client, config)
 
     return merged
