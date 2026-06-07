@@ -218,6 +218,12 @@ async def convert_novel_to_script_stream(
                     "refining_psy": ("refining_psy", "正在进行心理占比巡检与精简..."),
                     "done": ("done", "解析完成!"),
                     "error": ("error", data.get("message", "未知错误")),
+                    # === 流式输出事件（LLM 返回内容实时推送）===
+                    "stream_start": ("streaming", "[流式] 等待模型响应..."),
+                    "stream_chunk": ("stream_chunk", data.get("text", "")),
+                    "stream_done": ("stream_done",
+                                     f"[流式完成] 响应体={data.get('response_length', '?')}B"
+                                     f" | tokens={data.get('total_tokens', 'N/A')}"),
                 }
                 stage, msg = stage_map.get(event_type, ("unknown", str(data)))
                 try:
