@@ -39,29 +39,37 @@ from backend.schemas.script_schema import (
 # ============================================================
 
 # 单分片正文阈值（汉字数）
-CHUNK_SIZE = 6000
+CHUNK_SIZE = 2500
 # 相邻分片重叠区字数
-CHUNK_OVERLAP = 800
+CHUNK_OVERLAP = 500
 # 摘要最大字数
 SUMMARY_MAX_LENGTH = 150
 # psy 占比阈值（超过则触发精简）
 PSY_RATIO_THRESHOLD = 0.08
-# 人物预提取最大输入字数（取全文前5000字 + 后2000字）
-CHAR_EXTRACT_HEAD = 5000
-CHAR_EXTRACT_TAIL = 2000
+# 人物预提取最大输入字数（取全文前3000字 + 后1500字）
+CHAR_EXTRACT_HEAD = 3000
+CHAR_EXTRACT_TAIL = 1500
 
 # ============================================================
 # 限流控制配置
 # ============================================================
 
 # 分片间最小调用间隔（秒），防止连续请求触发速率限制
-CHUNK_CALL_INTERVAL = 2.0
+CHUNK_CALL_INTERVAL = 0.5
 # 429 限流错误退避初始等待时间（秒）
 RATE_LIMIT_BACKOFF_START = 5.0
 # 429 限流错误退避最大等待时间（秒）
 RATE_LIMIT_BACKOFF_MAX = 60.0
 # 429 限流最大自动重试次数（独立于 max_retries，专门处理限流）
 RATE_LIMIT_MAX_RETRIES = 3
+# 连接/超时错误退避初始等待时间（秒）
+CONN_BACKOFF_START = 2.0
+# 连接/超时错误退避最大等待时间（秒）
+CONN_BACKOFF_MAX = 30.0
+# 连接/超时错误最大自动重试次数
+CONN_MAX_RETRIES = 3
+# 退避抖动比例（±此比例的随机值，防止多个分片同时重试造成惊群效应)
+BACKOFF_JITTER_RATIO = 0.25
 
 
 def _log(msg: str) -> None:
@@ -528,12 +536,12 @@ def _split_by_fixed_size(text: str) -> list[str]:
         chunk = text[start:end]
         chunks.append(chunk)
         # 下一片起始位置回退重叠区
-        start = end - CHUNK_OVERLAP
-        # 防止无限循环
-        if start >= len(text):
-            break
-        if start <= end - CHUNK_OVERLAP + 1:
+        next_start = end - CHUNK_OVERLAP
+        # 确保前进：下一片起始必须大于当前起始
+        if next_start <= start:
             start = end
+        else:
+            start = next_start
 
     return chunks
 
@@ -936,7 +944,13 @@ def _extract_and_repair_yaml(ai_output: str) -> str:
     # 步骤3：修复常见缩进问题
     text = _fix_yaml_indentation(text)
 
-    # 步骤4：验证可解析性
+    # 步骤4：字段名自动映射 — 将 AI 返回的错误字段名替换为正确的 Schema 字段名
+    text = _repair_field_names(text)
+
+    # 步骤5：缺失必填字段自动注入
+    text = _inject_missing_fields(text)
+
+    # 步骤6：验证可解析性
     try:
         yaml.safe_load(text)
     except yaml.YAMLError:
@@ -967,6 +981,260 @@ def _fix_yaml_indentation(text: str) -> str:
     # 移除行尾空白
     lines = [line.rstrip() for line in text.split("\n")]
     return "\n".join(lines)
+
+
+def _repair_field_names(yaml_text: str) -> str:
+    """
+    字段名自动映射 — 将 AI 模型返回的错误字段名替换为 Schema 要求的正确字段名。
+
+    某些模型（如 LongCat）不严格遵循提示词中的 Schema 定义，会使用自己的字段命名。
+    此函数通过正则替换将常见错误映射到正确字段名。
+
+    采用上下文感知策略：根据缩进层级判断字段所属区域，
+    同一字段名在不同层级可能映射到不同目标（如 name 在 meta 下→script_title，
+    在 character 下→char_name）。
+
+    Args:
+        yaml_text: AI 返回的原始 YAML 文本
+
+    Returns:
+        str: 字段名已修正的 YAML 文本
+    """
+    # ============================================================
+    # 全局无歧义映射（任何层级都适用的映射）
+    # 格式：(旧名, 新名) — 旧名和新名不同时才会替换
+    # ============================================================
+    global_mappings = [
+        # === script_meta 层级（无歧义）===
+        ("script_name", "script_title"),
+        ("剧本名称", "script_title"),
+        ("剧名", "script_title"),
+        ("original_title", "original_novel_title"),
+        ("原著名称", "original_novel_title"),
+        ("小说原名", "original_novel_title"),
+        ("novel_title", "original_novel_title"),
+        ("章节范围", "chapter_range"),
+        ("chapters", "chapter_range"),
+        ("改编概要", "adapt_rule_note"),
+        ("adapt_summary", "adapt_rule_note"),
+
+        # === SceneAttr 层级（无歧义）===
+        ("place", "location"),
+        ("地点", "location"),
+
+        # === SceneContentUnit 层级（无歧义）===
+        ("speaker", "character"),
+        ("character_name", "character"),
+        ("角色", "character"),
+        ("text", "content"),
+        ("正文", "content"),
+        ("对话内容", "content"),
+
+        # === GlobalCharacter 层级（无歧义）===
+        ("character_id", "char_id"),
+        ("简介", "char_profile"),
+        ("description", "char_profile"),
+        ("人物描述", "char_profile"),
+        ("profile", "char_profile"),
+        ("角色名", "char_name"),
+    ]
+
+    # ============================================================
+    # 上下文感知映射：根据缩进层级判断
+    # 同名字段在不同层级映射到不同目标
+    # ============================================================
+
+    lines = yaml_text.split("\n")
+    result_lines = []
+    current_section = "root"  # root / meta / scenes / characters
+
+    for line in result_lines if False else lines:
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+
+        # 检测当前区域
+        if stripped.startswith("script_meta:"):
+            current_section = "meta"
+        elif stripped.startswith("script_scenes:"):
+            current_section = "scenes"
+        elif stripped.startswith("global_characters:"):
+            current_section = "characters"
+        elif indent == 0 and stripped and not stripped.startswith("-") and stripped.endswith(":"):
+            # 其他顶级键，退出当前区域
+            if stripped.startswith("adapt_rule_note:"):
+                current_section = "root"
+
+        # 先应用全局无歧义映射
+        modified_line = line
+        for old_name, new_name in global_mappings:
+            pattern = rf"^(\s*){re.escape(old_name)}\s*:"
+            match = re.match(pattern, modified_line)
+            if match:
+                new_line = re.sub(pattern, rf"\g<1>{new_name}:", modified_line)
+                if new_line != modified_line:
+                    _log(f"[REPAIR] 字段映射: '{old_name}' → '{new_name}' (1 处)")
+                    modified_line = new_line
+
+        # 再应用上下文感知映射
+        # title → script_title (meta层) 或 char_name (characters层)
+        if re.match(r"^(\s*)title\s*:", modified_line):
+            if current_section == "meta":
+                new_line = re.sub(r"^(\s*)title\s*:", r"\g<1>script_title:", modified_line)
+                if new_line != modified_line:
+                    _log("[REPAIR] 字段映射: 'title' → 'script_title' (1 处)")
+                    modified_line = new_line
+
+        # name → script_title (meta层) 或 char_name (characters层)
+        if re.match(r"^(\s*)name\s*:", modified_line):
+            if current_section == "meta":
+                new_line = re.sub(r"^(\s*)name\s*:", r"\g<1>script_title:", modified_line)
+                _log("[REPAIR] 字段映射: 'name' → 'script_title' (1 处)")
+                modified_line = new_line
+            elif current_section == "characters":
+                new_line = re.sub(r"^(\s*)name\s*:", r"\g<1>char_name:", modified_line)
+                _log("[REPAIR] 字段映射: 'name' → 'char_name' (1 处)")
+                modified_line = new_line
+
+        # type → scene_type (scenes层, scene_attr内) 或 unit_type (scenes层, unit内)
+        if re.match(r"^(\s*)type\s*:", modified_line):
+            if current_section == "scenes":
+                # 根据缩进判断：scene_attr内(6+空格) → scene_type, unit内(6+空格) → unit_type
+                if indent >= 8:
+                    new_line = re.sub(r"^(\s*)type\s*:", r"\g<1>unit_type:", modified_line)
+                    _log("[REPAIR] 字段映射: 'type' → 'unit_type' (1 处)")
+                    modified_line = new_line
+                elif indent >= 4:
+                    new_line = re.sub(r"^(\s*)type\s*:", r"\g<1>scene_type:", modified_line)
+                    _log("[REPAIR] 字段映射: 'type' → 'scene_type' (1 处)")
+                    modified_line = new_line
+
+        # summary → scene_summary (scenes层) 或 adapt_rule_note (meta层)
+        if re.match(r"^(\s*)summary\s*:", modified_line):
+            if current_section == "scenes":
+                new_line = re.sub(r"^(\s*)summary\s*:", r"\g<1>scene_summary:", modified_line)
+                _log("[REPAIR] 字段映射: 'summary' → 'scene_summary' (1 处)")
+                modified_line = new_line
+            elif current_section == "meta":
+                new_line = re.sub(r"^(\s*)summary\s*:", r"\g<1>adapt_rule_note:", modified_line)
+                _log("[REPAIR] 字段映射: 'summary' → 'adapt_rule_note' (1 处)")
+                modified_line = new_line
+
+        # synopsis → scene_summary (scenes层)
+        if re.match(r"^(\s*)synopsis\s*:", modified_line):
+            if current_section == "scenes":
+                new_line = re.sub(r"^(\s*)synopsis\s*:", r"\g<1>scene_summary:", modified_line)
+                _log("[REPAIR] 字段映射: 'synopsis' → 'scene_summary' (1 处)")
+                modified_line = new_line
+
+        # time → time_type (scenes层, scene_attr内)
+        if re.match(r"^(\s*)time\s*:", modified_line):
+            if current_section == "scenes":
+                new_line = re.sub(r"^(\s*)time\s*:", r"\g<1>time_type:", modified_line)
+                _log("[REPAIR] 字段映射: 'time' → 'time_type' (1 处)")
+                modified_line = new_line
+
+        # id → scene_id (scenes层, 4空格) 或 unit_id (scenes层, 6+空格)
+        if re.match(r"^(\s*)id\s*:", modified_line):
+            if current_section == "scenes":
+                if indent >= 6:
+                    new_line = re.sub(r"^(\s*)id\s*:", r"\g<1>unit_id:", modified_line)
+                    _log("[REPAIR] 字段映射: 'id' → 'unit_id' (1 处)")
+                    modified_line = new_line
+                elif indent >= 4:
+                    new_line = re.sub(r"^(\s*)id\s*:", r"\g<1>scene_id:", modified_line)
+                    _log("[REPAIR] 字段映射: 'id' → 'scene_id' (1 处)")
+                    modified_line = new_line
+
+        result_lines.append(modified_line)
+
+    return "\n".join(result_lines)
+
+
+def _inject_missing_fields(yaml_text: str) -> str:
+    """
+    自动注入 AI 输出中缺失的必填字段。
+
+    某些模型会遗漏必填字段（如 original_novel_title、chapter_range、scene_serial），
+    导致 Pydantic 校验失败。此函数在 YAML 文本中检测并注入这些缺失字段。
+
+    Args:
+        yaml_text: 经过字段名修复后的 YAML 文本
+
+    Returns:
+        str: 注入缺失字段后的 YAML 文本
+
+    Note:
+        注入的字段使用合理的默认值或空字符串，确保通过 Schema 校验。
+    """
+    lines = yaml_text.split("\n")
+    result_lines = list(lines)
+
+    # 检测 script_meta 中缺失的字段
+    meta_fields_present = set()
+    in_meta = False
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("script_meta:"):
+            in_meta = True
+            continue
+        if in_meta:
+            indent = len(line) - len(stripped)
+            if indent == 0 and stripped and not stripped.startswith("#"):
+                in_meta = False
+                continue
+            # 提取字段名
+            field_match = re.match(r"^\s+(\w+)\s*:", stripped)
+            if field_match:
+                meta_fields_present.add(field_match.group(1))
+
+    # 需要注入的 meta 字段（在 script_meta: 行之后插入）
+    meta_injections = []
+    if "original_novel_title" not in meta_fields_present:
+        meta_injections.append("  original_novel_title: \"\"")
+        _log("[REPAIR] 注入缺失字段: 'original_novel_title'")
+    if "chapter_range" not in meta_fields_present:
+        meta_injections.append("  chapter_range: \"\"")
+        _log("[REPAIR] 注入缺失字段: 'chapter_range'")
+    if "create_time" not in meta_fields_present:
+        from datetime import datetime
+        meta_injections.append(f"  create_time: \"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\"")
+        _log("[REPAIR] 注入缺失字段: 'create_time'")
+
+    # 在 script_meta: 行之后插入缺失字段
+    if meta_injections:
+        new_lines = []
+        for line in result_lines:
+            new_lines.append(line)
+            if line.lstrip().startswith("script_meta:"):
+                for injection in meta_injections:
+                    new_lines.append(injection)
+        result_lines = new_lines
+
+    # 检测 script_scenes 中缺失的 scene_serial 字段
+    # 为每个 scene 自动生成 scene_serial
+    has_serial = any("scene_serial:" in line for line in result_lines)
+    if not has_serial:
+        new_lines = []
+        scene_counter = 0
+        for line in result_lines:
+            stripped = line.lstrip()
+            # 检测 scene 条目开始（如 "  - scene_id:"）
+            if re.match(r"^\s+-\s+scene_id\s*:", stripped) or re.match(r"^\s+-\s+id\s*:", stripped):
+                scene_counter += 1
+                new_lines.append(line)
+                # 在 scene_id 行之后插入 scene_serial
+                indent_match = re.match(r"^(\s+)-", line)
+                if indent_match:
+                    base_indent = indent_match.group(1)
+                    new_lines.append(f"{base_indent}  scene_serial: \"S{scene_counter:02d}\"")
+                    _log(f"[REPAIR] 注入缺失字段: 'scene_serial' → S{scene_counter:02d}")
+                else:
+                    new_lines.append(f"    scene_serial: \"S{scene_counter:02d}\"")
+            else:
+                new_lines.append(line)
+        result_lines = new_lines
+
+    return "\n".join(result_lines)
 
 
 def _aggressive_yaml_repair(text: str) -> str:
@@ -1151,12 +1419,32 @@ def _call_llm(
     client: OpenAI, config: AIConfig, system_prompt: str, user_message: str
 ) -> str:
     """
-    调用大语言模型 API 并返回原始文本输出。
+    调用大语言模型 API 并返回原始文本输出（流式接收）。
 
-    内置 429 速率限制自动退避重试机制：
-    - 检测到 RateLimitError 时按指数退避等待后自动重试
-    - 退避间隔从 5s 开始，每次翻倍，最大 60s
-    - 最多退避重试 3 次（独立于外层 max_retries）
+    使用 stream=True 模式逐块接收 LLM 输出，每块实时写入后端日志，
+    便于排查连接中断、内容截断、格式异常等问题。
+
+    内置多层自动重试与退避机制，按错误类型分类处理：
+
+    ┌─────────────────────┬──────────────┬──────────────────────────┐
+    │ 错误类型            │ 退避策略     │ 最大重试次数             │
+    ├─────────────────────┼──────────────┼──────────────────────────┤
+    │ RateLimitError (429)│ 指数退避+抖动 │ RATE_LIMIT_MAX_RETRIES  │
+    │                     │ 5s→10s→20s   │ (默认3次)               │
+    ├─────────────────────┼──────────────┼──────────────────────────┤
+    │ APIConnectionError  │ 指数退避+抖动 │ CONN_MAX_RETRIES        │
+    │ APITimeoutError     │ 2s→4s→8s     │ (默认3次)               │
+    ├─────────────────────┼──────────────┼──────────────────────────┤
+    │ 其他异常            │ 不重试，直接抛出                        │
+    │ (BadRequest/Auth等) │              │                          │
+    └─────────────────────┴──────────────┴──────────────────────────┘
+
+    所有退避均加入 ±25% 随机抖动，防止多个分片同时重试造成惊群效应。
+
+    流式输出日志格式：
+        [AI] [STREAM>>] 首批文本到达...（累计 N 字符）
+        [AI] [STREAM>>] ...后续文本...
+        [AI] [STREAM==] 流式接收完成 | 总计=XXXXB | tokens=p/c/t
 
     Args:
         client: OpenAI客户端实例
@@ -1165,17 +1453,37 @@ def _call_llm(
         user_message: 用户消息
 
     Returns:
-        str: AI 返回的原始文本内容
+        str: AI 返回的完整原始文本内容（所有流式块拼接）
 
     Raises:
-        RuntimeError: AI 返回空内容或限流重试耗尽时抛出
+        RuntimeError: AI 返回空内容、限流/连接重试耗尽时抛出
     """
-    # 导入 openai 的 RateLimitError 用于精确捕获
-    from openai import RateLimitError
+    import random
+    from openai import (
+        APIConnectionError,
+        APITimeoutError,
+        RateLimitError,
+    )
 
-    for retry in range(RATE_LIMIT_MAX_RETRIES + 1):
+    # 预计算请求体大小（用于日志，不随重试变化）
+    sp_len = len(system_prompt.encode("utf-8"))
+    um_len = len(user_message.encode("utf-8"))
+    total_bytes = sp_len + um_len
+
+    # 统一最大重试次数（取两类错误中较大的值）
+    max_retries = max(RATE_LIMIT_MAX_RETRIES, CONN_MAX_RETRIES)
+
+    for retry in range(max_retries + 1):
         try:
-            response = client.chat.completions.create(
+            # === 请求前日志 ===
+            _log(
+                f"[AI] [REQ] 调用 LLM (retry={retry}/{max_retries}) | "
+                f"system_prompt={sp_len}B, user_message={um_len}B, 总计={total_bytes}B | "
+                f"model={config.model_name}, max_tokens={config.max_tokens}, timeout={config.timeout}s"
+            )
+
+            # === 发起流式 API 请求 ===
+            stream = client.chat.completions.create(
                 model=config.model_name,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -1183,28 +1491,137 @@ def _call_llm(
                 ],
                 temperature=config.temperature,
                 max_tokens=config.max_tokens,
+                stream=True,
             )
 
-            content = response.choices[0].message.content
-            if not content:
-                raise RuntimeError("AI 返回了空内容")
+            # === 流式接收：逐块收集并实时打印 ===
+            content_parts: list[str] = []
+            usage_info = None
+            first_chunk_logged = False
 
-            return content
+            for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta is None:
+                    continue
+
+                # 提取本块文本
+                chunk_text = delta.content or ""
+                if not chunk_text:
+                    continue
+
+                content_parts.append(chunk_text)
+
+                # 获取 usage（通常在最后一个 chunk 中返回）
+                if chunk.usage:
+                    usage_info = chunk.usage
+
+                # 实时日志输出
+                current_len = sum(len(p.encode("utf-8")) for p in content_parts)
+                if not first_chunk_logged:
+                    _log(f"[AI] [STREAM>>] 首批数据到达: 「{chunk_text[:80]}{'...' if len(chunk_text) > 80 else ''}」(累计 {current_len}B)")
+                    first_chunk_logged = True
+                else:
+                    # 后续块：截断显示，避免日志刷屏
+                    display = chunk_text[:120].replace("\n", "\\n")
+                    _log(f"[AI] [STREAM>>] {display}{'...' if len(chunk_text) > 120 else ''} ({current_len}B)")
+
+            # === 流结束，拼接完整内容 ===
+            full_content = "".join(content_parts)
+
+            if not full_content:
+                raise RuntimeError("AI 流式返回了空内容")
+
+            resp_len = len(full_content.encode("utf-8"))
+            if usage_info:
+                usage_str = (
+                    f"prompt={usage_info.prompt_tokens}, "
+                    f"completion={usage_info.completion_tokens}, "
+                    f"total={usage_info.total_tokens}"
+                )
+            else:
+                usage_str = "usage=不可用(流式未返回)"
+            _log(
+                f"[AI] [STREAM==] 流式接收完成 | 响应体={resp_len}B | {usage_str}"
+            )
+
+            return full_content
 
         except RateLimitError as e:
-            if retry < RATE_LIMIT_MAX_RETRIES:
-                # 指数退避：5s → 10s → 20s ...
-                wait_time = min(
-                    RATE_LIMIT_BACKOFF_START * (2 ** retry),
-                    RATE_LIMIT_BACKOFF_MAX,
-                )
-                _log(
-                    f"[AI] [429-BACKOFF] 触发 429 速率限制，等待 {wait_time:.0f}s 后重试 "
-                    f"({retry + 1}/{RATE_LIMIT_MAX_RETRIES})"
-                )
-                time.sleep(wait_time)
-                continue
-            else:
+            """429 速率限制：指数退避 + 抖动"""
+            if retry >= RATE_LIMIT_MAX_RETRIES:
                 raise RuntimeError(
-                    f"API 速率限制，已退避重试 {RATE_LIMIT_MAX_RETRIES} 次仍失败: {str(e)[:200]}"
+                    f"API 速率限制(429)，已退避重试 {RATE_LIMIT_MAX_RETRIES} 次仍失败: {str(e)[:200]}"
                 ) from e
+
+            wait_time = _calc_backoff_with_jitter(
+                base=RATE_LIMIT_BACKOFF_START,
+                multiplier=2 ** retry,
+                cap=RATE_LIMIT_BACKOFF_MAX,
+                jitter_ratio=BACKOFF_JITTER_RATIO,
+            )
+            _log(
+                f"[AI] [429-BACKOFF] 触发速率限制，等待 {wait_time:.1f}s 后重试 "
+                f"({retry + 1}/{RATE_LIMIT_MAX_RETRIES})"
+            )
+            time.sleep(wait_time)
+
+        except (APIConnectionError, APITimeoutError) as e:
+            """连接/超时错误：独立退避策略（比429更激进）"""
+            err_type = type(e).__name__
+            if retry >= CONN_MAX_RETRIES:
+                raise RuntimeError(
+                    f"API 连接/超时错误({err_type})，已退避重试 {CONN_MAX_RETRIES} 次仍失败: {str(e)[:200]}"
+                ) from e
+
+            wait_time = _calc_backoff_with_jitter(
+                base=CONN_BACKOFF_START,
+                multiplier=2 ** retry,
+                cap=CONN_BACKOFF_MAX,
+                jitter_ratio=BACKOFF_JITTER_RATIO,
+            )
+            _log(
+                f"[AI] [CONN-BACKOFF] {err_type}: {str(e)[:150]} | "
+                f"等待 {wait_time:.1f}s 后重试 ({retry + 1}/{CONN_MAX_RETRIES}) | "
+                f"请求体约={total_bytes}B"
+            )
+            time.sleep(wait_time)
+
+        except Exception as e:
+            """其他异常（参数错误、认证失败等）：不重试，记录后直接抛出"""
+            err_type = type(e).__name__
+            _log(
+                f"[AI] [ERR] LLM 调用异常（不可重试）| 类型={err_type} | "
+                f"原因={str(e)[:300]} | 请求体约={total_bytes}B"
+            )
+            raise
+
+    # 理论上不会到达此处（所有分支都已 raise 或 return），作为兜底
+    raise RuntimeError(f"LLM 调用在 {max_retries} 次重试后仍未返回有效结果")
+
+
+def _calc_backoff_with_jitter(
+    base: float, multiplier: int, cap: float, jitter_ratio: float
+) -> float:
+    """
+    计算带随机抖动的退避等待时间。
+
+    退避公式：min(base × multiplier, cap) × (1 ± jitter_ratio)
+
+    Args:
+        base: 基础等待时间（秒）
+        multiplier: 指数倍数（通常为 2^retry）
+        cap: 上限等待时间（秒）
+        jitter_ratio: 抖动比例，0.25 表示 ±25% 的随机偏移
+
+    Returns:
+        float: 最终的退避等待时间（秒），始终 ≥ 0
+
+    Example:
+        >>> _calc_backoff_with_jitter(5.0, 2, 60.0, 0.25)  # 可能返回 7.2 ~ 12.8 之间的值
+    """
+    import random
+
+    raw = min(base * multiplier, cap)
+    jitter = random.uniform(-jitter_ratio, jitter_ratio)
+    result = raw * (1 + jitter)
+    return max(result, 0.1)  # 保证至少等待 0.1 秒

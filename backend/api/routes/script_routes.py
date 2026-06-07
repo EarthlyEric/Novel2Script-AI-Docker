@@ -12,6 +12,7 @@
 import json
 import sys
 import time
+import asyncio
 
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
@@ -170,7 +171,7 @@ async def convert_novel_to_script_stream(
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     async def event_generator():
-        """异步生成器，逐步产出 SSE 事件"""
+        """异步生成器，通过 asyncio.Queue 实时产出 SSE 事件"""
         try:
             # ---- 步骤1：获取原始文本 ----
             raw_text = ""
@@ -184,6 +185,50 @@ async def convert_novel_to_script_stream(
             else:
                 yield _sse_event("error", {"message": "请提供小说正文文本或上传文件"})
                 return
+
+            # 使用 asyncio.Queue 实现线程→协程的高效事件传递
+            event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+            def on_progress(event_type: str, data: dict) -> None:
+                """
+                AI 解析服务的进度回调。
+                通过 put_nowait 将事件推入异步队列（非阻塞）。
+                """
+                stage_map = {
+                    "start": ("parsing", f"开始AI解析... (文本长度: {data.get('text_length', '?')} 字)"),
+                    "parsing_single": ("calling_llm", "正在调用 AI 模型进行单次解析..."),
+                    "parsing_chunks": ("parsing_chunks", f"进入分片模式（{data.get('text_length', '?')} 字符）"),
+                    "extracting_chars": ("extracting_chars", "正在预提取人物信息..."),
+                    "chars_extracted": ("chars_extracted",
+                                        f"人物提取完成，共 {data.get('char_count', 0)} 个角色"),
+                    "chunking": ("chunking", "正在切割文本为分片..."),
+                    "chunks_ready": ("chunks_ready",
+                                     f"文本已切割为 {data.get('total', 0)} 个分片"),
+                    "chunk_wait": ("waiting",
+                                    f"等待速率限制冷却 ({data.get('wait_seconds', 2)}s)..."),
+                    "chunk_start": ("chunk_start",
+                                    f"正在解析第 {data.get('index', '?')}/{data.get('total', '?')} 片..."),
+                    "chunk_done": ("chunk_done",
+                                   f"第 {data.get('index', '?')}/{data.get('total', '?')} 片解析完成 "
+                                   f"(+{data.get('scenes', 0)} 场戏)"),
+                    "chunk_fail": ("chunk_fail",
+                                   f"第 {data.get('index', '?')}/{data.get('total', '?')} 片解析失败，跳过"),
+                    "merging": ("merging",
+                                f"正在合并 {data.get('completed_chunks', 0)}/{data.get('total_chunks', 0)} 个分片结果..."),
+                    "refining_psy": ("refining_psy", "正在进行心理占比巡检与精简..."),
+                    "done": ("done", "解析完成!"),
+                    "error": ("error", data.get("message", "未知错误")),
+                }
+                stage, msg = stage_map.get(event_type, ("unknown", str(data)))
+                try:
+                    event_queue.put_nowait({
+                        "stage": stage,
+                        "message": msg,
+                        "data": data,
+                        "event_type": event_type,
+                    })
+                except Exception:
+                    pass
 
             # 发送初始进度
             yield _sse_event("progress", {
@@ -213,62 +258,13 @@ async def convert_novel_to_script_stream(
             )
             log(f"[STREAM] AI配置: model={config.model_name}")
 
-            # ---- 步骤4：AI解析（带进度回调） ----
-            final_result = [None]
-            final_error = [None]
-
-            def on_progress(event_type: str, data: dict) -> None:
-                """
-                AI 解析服务的进度回调。
-                将同步回调转换为 async queue 消息供 event_generator 消费。
-                """
-                stage_map = {
-                    "start": ("parsing", f"开始AI解析... (文本长度: {data.get('text_length', '?')} 字)"),
-                    "parsing_single": ("calling_llm", "正在调用 AI 模型进行单次解析..."),
-                    "parsing_chunks": ("parsing_chunks", f"进入分片模式（{data.get('text_length', '?')} 字符）"),
-                    "extracting_chars": ("extracting_chars", "正在预提取人物信息..."),
-                    "chars_extracted": ("chars_extracted",
-                                        f"人物提取完成，共 {data.get('char_count', 0)} 个角色"),
-                    "chunking": ("chunking", "正在切割文本为分片..."),
-                    "chunks_ready": ("chunks_ready",
-                                     f"文本已切割为 {data.get('total', 0)} 个分片"),
-                    "chunk_wait": ("waiting",
-                                    f"等待速率限制冷却 ({data.get('wait_seconds', 2)}s)..."),
-                    "chunk_start": ("chunk_start",
-                                    f"正在解析第 {data.get('index', '?')}/{data.get('total', '?')} 片..."),
-                    "chunk_done": ("chunk_done",
-                                   f"第 {data.get('index', '?')}/{data.get('total', '?')} 片解析完成 "
-                                   f"(+{data.get('scenes', 0)} 场戏)"),
-                    "chunk_fail": ("chunk_fail",
-                                   f"第 {data.get('index', '?')}/{data.get('total', '?')} 片解析失败，跳过"),
-                    "merging": ("merging",
-                                f"正在合并 {data.get('completed_chunks', 0)}/{data.get('total_chunks', 0)} 个分片结果..."),
-                    "refining_psy": ("refining_psy", "正在进行心理占比巡检与精简..."),
-                    "done": ("done", "解析完成!"),
-                    "error": ("error", data.get("message", "未知错误")),
-                }
-                stage, msg = stage_map.get(event_type, ("unknown", str(data)))
-                # 将结果存入共享变量
-                if event_type == "done":
-                    final_result[0] = data
-                elif event_type == "error":
-                    final_error[0] = data
-
-                # 使用线程安全的方式传递事件到异步生成器
-                nonlocal _pending_events
-                _pending_events.append({
-                    "stage": stage,
-                    "message": msg,
-                    "data": data,
-                })
-
-            # 用于在线程和协程之间传递事件的列表
-            _pending_events: list[dict] = []
-
-            # 在线程池中运行同步的 AI 解析（避免阻塞事件循环）
+            # ---- 步骤4：在线程池中运行同步 AI 解析 ----
+            final_result: list[dict | None] = [None]
+            final_error: list[dict | None] = [None]
             loop = asyncio.get_event_loop()
 
             def run_parse():
+                """在独立线程中运行同步 AI 解析"""
                 try:
                     script_data = parse_novel_to_script(
                         novel_text=preprocess_result.clean_text,
@@ -276,9 +272,7 @@ async def convert_novel_to_script_stream(
                         config=config,
                         progress_callback=on_progress,
                     )
-                    # 更新章节范围
                     script_data.script_meta.chapter_range = preprocess_result.chapter_range
-                    # 渲染 YAML
                     yaml_text = render_script_yaml(script_data)
                     final_result[0] = {
                         "scenes": len(script_data.script_scenes),
@@ -288,37 +282,48 @@ async def convert_novel_to_script_stream(
                     }
                 except Exception as e:
                     final_error[0] = {"type": type(e).__name__, "message": str(e)[:500]}
-                    _pending_events.append({
-                        "stage": "error",
-                        "message": f"解析异常: [{type(e).__name__}] {str(e)[:200]}",
-                        "data": {"type": type(e).__name__, "message": str(e)[:300]},
-                    })
+                    try:
+                        event_queue.put_nowait({
+                            "stage": "error",
+                            "message": f"解析异常: [{type(e).__name__}] {str(e)[:200]}",
+                            "data": {"type": type(e).__name__, "message": str(e)[:300]},
+                        })
+                    except Exception:
+                        pass
 
-            # 启动后台任务
+            # 启动后台线程执行解析
             parse_task = loop.run_in_executor(None, run_parse)
 
-            # 轮询 pending_events 并发送给客户端
-            last_tick = time.time()
-            while not parse_task.done() or _pending_events:
-                if _pending_events:
-                    evt = _pending_events.pop(0)
+            # 从队列读取事件并推送给客户端（实时、低延迟）
+            last_heartbeat = time.time()
+            while True:
+                try:
+                    # 短超时等待队列事件（150ms 轮询间隔）
+                    evt = await asyncio.wait_for(event_queue.get(), timeout=0.15)
+                    if evt is None:
+                        break
                     yield _sse_event("progress", evt)
-                    last_tick = time.time()
+                    last_heartbeat = time.time()
+                except asyncio.TimeoutError:
+                    # 队列为空，检查任务是否完成
+                    if parse_task.done():
+                        # 任务完成，排空剩余事件
+                        remaining = []
+                        while not event_queue.empty():
+                            try:
+                                item = event_queue.get_nowait()
+                                if item is not None:
+                                    remaining.append(item)
+                            except asyncio.QueueEmpty:
+                                break
+                        for evt in remaining:
+                            yield _sse_event("progress", evt)
+                        break
 
-                if parse_task.done():
-                    # 任务完成，发送剩余事件
-                    while _pending_events:
-                        evt = _pending_events.pop(0)
-                        yield _sse_event("progress", evt)
-                    break
-
-                # 每 0.5s 轮询一次，避免忙等待
-                await asyncio.sleep(0.5)
-
-                # 心跳：每 15s 发一次 keepalive 防止超时
-                if time.time() - last_tick > 15:
-                    yield _sse_event("heartbeat", {})
-                    last_tick = time.time()
+                    # 心跳：每 5s 发一次 keepalive（比之前 15s 更频繁）
+                    if time.time() - last_heartbeat > 5:
+                        yield _sse_event("heartbeat", {})
+                        last_heartbeat = time.time()
 
             # 等待任务完成确保无遗漏
             await parse_task

@@ -165,6 +165,7 @@ function downloadYaml() {
 <style scoped>
 .preview-view {
   animation: fadeInUp 0.5s var(--ease-out) both;
+  padding-bottom: 80px;
 }
 
 @keyframes fadeInUp {
