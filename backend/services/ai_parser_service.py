@@ -39,23 +39,23 @@ from backend.schemas.script_schema import (
 # ============================================================
 
 # 单分片正文阈值（汉字数）
-CHUNK_SIZE = 6000
+CHUNK_SIZE = 2500
 # 相邻分片重叠区字数
-CHUNK_OVERLAP = 800
+CHUNK_OVERLAP = 500
 # 摘要最大字数
 SUMMARY_MAX_LENGTH = 150
 # psy 占比阈值（超过则触发精简）
 PSY_RATIO_THRESHOLD = 0.08
-# 人物预提取最大输入字数（取全文前5000字 + 后2000字）
-CHAR_EXTRACT_HEAD = 5000
-CHAR_EXTRACT_TAIL = 2000
+# 人物预提取最大输入字数（取全文前3000字 + 后1500字）
+CHAR_EXTRACT_HEAD = 3000
+CHAR_EXTRACT_TAIL = 1500
 
 # ============================================================
 # 限流控制配置
 # ============================================================
 
 # 分片间最小调用间隔（秒），防止连续请求触发速率限制
-CHUNK_CALL_INTERVAL = 2.0
+CHUNK_CALL_INTERVAL = 0.5
 # 429 限流错误退避初始等待时间（秒）
 RATE_LIMIT_BACKOFF_START = 5.0
 # 429 限流错误退避最大等待时间（秒）
@@ -936,7 +936,10 @@ def _extract_and_repair_yaml(ai_output: str) -> str:
     # 步骤3：修复常见缩进问题
     text = _fix_yaml_indentation(text)
 
-    # 步骤4：验证可解析性
+    # 步骤4：字段名自动映射 — 将 AI 返回的错误字段名替换为正确的 Schema 字段名
+    text = _repair_field_names(text)
+
+    # 步骤5：验证可解析性
     try:
         yaml.safe_load(text)
     except yaml.YAMLError:
@@ -967,6 +970,135 @@ def _fix_yaml_indentation(text: str) -> str:
     # 移除行尾空白
     lines = [line.rstrip() for line in text.split("\n")]
     return "\n".join(lines)
+
+
+def _repair_field_names(yaml_text: str) -> str:
+    """
+    字段名自动映射 — 将 AI 模型返回的错误字段名替换为 Schema 要求的正确字段名。
+
+    某些模型（如 LongCat）不严格遵循提示词中的 Schema 定义，会使用自己的字段命名。
+    此函数通过正则替换将常见错误映射到正确字段名。
+
+    映射规则按优先级排序：
+      - 精确匹配（如 title → script_title）
+      - 前缀/后缀变体（如 script_name → script_title）
+      - 中文别名（如 剧本名称 → script_title）
+
+    Args:
+        yaml_text: AI 返回的原始 YAML 文本
+
+    Returns:
+        str: 字段名已修正的 YAML 文本
+    """
+    # ============================================================
+    # 字段名映射表：错误字段名 → 正确的 Schema 字段名
+    # 格式：(旧名, 新名) — 按从长到短排列避免部分替换问题
+    # ============================================================
+    field_mappings = [
+        # === script_meta 层级 ===
+        ("script_name", "script_title"),
+        ("剧本名称", "script_title"),
+        ("剧名", "script_title"),
+        ("name", "script_title"),
+        ("title", "script_title"),
+        ("original_title", "original_novel_title"),
+        ("原著名称", "original_novel_title"),
+        ("小说原名", "original_novel_title"),
+        ("novel_title", "original_novel_title"),
+        ("source_author", "author"),
+        ("原著作者", "author"),
+        ("writer", "author"),
+        ("chapter_range", "chapter_range"),  # 保持不变
+        ("章节范围", "chapter_range"),
+        ("chapters", "chapter_range"),
+        ("total_scenes", "total_scenes"),     # 保持不变
+        ("场景总数", "total_scenes"),
+        ("scene_count", "total_scenes"),
+        ("adapt_summary", "adapt_summary"),   # 保持不变
+        ("改编概要", "adapt_summary"),
+        ("summary", "adapt_summary"),
+
+        # === SceneAttr 层级 ===
+        ("scene_id", "scene_id"),             # 保持不变
+        ("id", "scene_id"),
+        ("scene_label", "scene_label"),       # 保持不变
+        ("label", "scene_label"),
+        ("scene_type", "scene_type"),         # 保持不变
+        ("type", "scene_type"),
+        ("location", "location"),             # 保持不变
+        ("place", "location"),
+        ("地点", "location"),
+        ("time_type", "time_type"),           # 保持不变
+        ("time", "time_type"),
+        ("时间段", "time_type"),
+        ("scene Synopsis", "sceneSynopsis"),  # 处理空格变体
+        ("synopsis", "sceneSynopsis"),
+        ("剧情概要", "sceneSynopsis"),
+        ("summary", "sceneSynopsis"),          # 注意：在 scene 下 summary → sceneSynopsis
+
+        # === SceneContentUnit 层级 ===
+        ("unit_id", "unit_id"),               # 保持不变
+        ("unit_type", "unit_type"),           # 保持不变
+        ("type", "unit_type"),                 # 注意：在 unit 下 type → unit_type
+        ("character_name", "character_name"),  # 保持不变
+        ("char", "character_name"),
+        ("角色", "character_name"),
+        ("speaker", "character_name"),
+        ("content", "content"),               # 保持不变
+        ("text", "content"),
+        ("正文", "content"),
+        ("对话内容", "content"),
+        ("dialogue", "content"),
+        ("emotion_tag", "emotion_tag"),       # 保持不变
+        ("emotion", "emotion_tag"),
+        ("情绪标签", "emotion_tag"),
+        ("备注", "note"),
+        ("notes", "note"),
+        ("remark", "note"),
+
+        # === GlobalCharacter 层级 ===
+        ("char_id", "char_id"),               # 保持不变
+        ("character_id", "char_id"),
+        ("char_name", "char_name"),            # 保持不变
+        ("name", "char_name"),                # 注意：在 character 下 name → char_name
+        ("角色名", "char_name"),
+        ("alias", "alias"),                   # 保持不变
+        ("aliases", "alias"),
+        ("别名", "alias"),
+        ("role_type", "role_type"),           # 保持不变
+        ("role", "role_type"),
+        ("角色类型", "role_type"),
+        ("char_profile", "char_profile"),     # 保持不变
+        ("profile", "char_profile"),
+        ("简介", "char_profile"),
+        ("description", "char_profile"),
+        ("人物描述", "char_profile"),
+        ("first_appearance", "first_appearance"),  # 保持不变
+        ("first_scene", "first_appearance"),
+        ("出场场次", "first_appearance"),
+    ]
+
+    result = yaml_text
+    replaced: set[str] = set()
+
+    for old_name, new_name in field_mappings:
+        # 跳过已替换的（避免重复处理保持不变的项）
+        if old_name == new_name and old_name in replaced:
+            continue
+
+        # 使用正则匹配 YAML 键名：行首 + 可选缩进 + 字段名 + 冒号
+        # 排除已经在冒号右侧的值（如 "title: xxx" 中 xxx 不应被替换）
+        pattern = rf"^(\s*){re.escape(old_name)}\s*:"
+        replacement = rf"\g<1>{new_name}:"
+
+        matches = re.findall(pattern, result, re.MULTILINE)
+        if matches:
+            result = re.sub(pattern, replacement, result, flags=re.MULTILINE)
+            if old_name != new_name:
+                _log(f"[REPAIR] 字段映射: '{old_name}' → '{new_name}' ({len(matches)} 处)")
+                replaced.add(old_name)
+
+    return result
 
 
 def _aggressive_yaml_repair(text: str) -> str:

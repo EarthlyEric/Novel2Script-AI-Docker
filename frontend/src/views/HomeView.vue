@@ -253,9 +253,14 @@
                   <span class="log-msg">{{ log.message }}</span>
                   <span v-if="log.extra" class="log-extra">{{ log.extra }}</span>
                 </div>
+                <!-- 动态活动行：显示当前阶段 + 已用时间 -->
                 <div class="log-line log-active">
                   <span class="log-time">{{ getCurrentTime() }}</span>
-                  <span class="log-msg log-blink">处理中...</span>
+                  <span class="log-msg">
+                    <span v-if="currentStage" class="log-stage-text">{{ currentStage }}</span>
+                    <span v-else class="log-blink">等待响应...</span>
+                  </span>
+                  <span class="log-extra log-elapsed">⏱ {{ elapsedSeconds }}s</span>
                 </div>
               </div>
             </div>
@@ -267,7 +272,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, nextTick, onUnmounted } from 'vue'
+import { ref, reactive, nextTick, onUnmounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { convertNovelStream, testConnection } from '@/api/script'
@@ -293,7 +298,25 @@ const progressLogs = ref<ProgressLog[]>([])
 const currentStage = ref('')
 const totalChunks = ref(0)
 const completedChunks = ref(0)
+const elapsedSeconds = ref(0)
 let abortController: AbortController | null = null
+let elapsedTimer: ReturnType<typeof setInterval> | null = null
+
+/** 启动已用时间计时器 */
+function startElapsedTimer() {
+  elapsedSeconds.value = 0
+  elapsedTimer = window.setInterval(() => {
+    elapsedSeconds.value++
+  }, 1000)
+}
+
+/** 停止计时器 */
+function stopElapsedTimer() {
+  if (elapsedTimer) {
+    clearInterval(elapsedTimer)
+    elapsedTimer = null
+  }
+}
 
 const form = reactive({
   novel_title: '',
@@ -544,6 +567,9 @@ async function handleSubmit() {
   // 创建 AbortController 用于取消请求
   abortController = new AbortController()
 
+  // 启动已用时间计时器
+  startElapsedTimer()
+
   // 添加首条日志
   addLog('start', '提交转换请求...')
 
@@ -592,6 +618,7 @@ async function handleSubmit() {
   } finally {
     converting.value = false
     abortController = null
+    stopElapsedTimer()
   }
 }
 
@@ -676,6 +703,7 @@ onUnmounted(() => {
   if (abortController) {
     abortController.abort()
   }
+  stopElapsedTimer()
 })
 </script>
 
@@ -1246,6 +1274,17 @@ onUnmounted(() => {
   font-size: 11px;
   color: var(--accent-dim);
   font-weight: 500;
+}
+
+/* 动态活动行 */
+.log-stage-text {
+  color: var(--accent);
+  font-weight: 500;
+}
+.log-elapsed {
+  color: var(--text-muted) !important;
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+  opacity: 0.8;
 }
 
 /* 各阶段颜色 */
