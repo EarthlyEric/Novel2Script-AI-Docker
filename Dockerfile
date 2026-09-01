@@ -24,10 +24,10 @@ RUN npm run build
 FROM python:3.12-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    OPENAI_API_KEY="" \
-    OPENAI_BASE_URL="" \
-    OPENAI_MODEL_NAME=""
+    PYTHONUNBUFFERED=1
+# NOTE: AI credentials (OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL_NAME)
+# are intentionally NOT set here (Dockerfile lint forbids secrets in ENV).
+# Pass them at runtime instead:  docker run -e OPENAI_API_KEY=... ...
 
 # Install Nginx + backend Python dependencies (single merged layer for smaller image)
 COPY backend/requirements.txt /tmp/requirements.txt
