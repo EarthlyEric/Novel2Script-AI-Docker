@@ -1,0 +1,18 @@
+# Version control and docs
+.git
+.gitignore
+README.md
+LICENSE
+
+# Local build artifacts and dependencies
+frontend/node_modules
+frontend/dist
+**/__pycache__
+**/*.pyc
+**/.venv
+venv
+
+# Docker config itself (keep the build context lean)
+Dockerfile
+docker-compose.yml
+.dockerignore

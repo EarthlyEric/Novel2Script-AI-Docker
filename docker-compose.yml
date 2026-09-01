@@ -1,0 +1,13 @@
+services:
+  novel2script:
+    build: .
+    image: novel2script-ai:latest
+    container_name: novel2script-ai
+    ports:
+      - "8080:80"
+    environment:
+      # Optional: preset default AI config (values entered in the frontend panel override these)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - OPENAI_MODEL_NAME=${OPENAI_MODEL_NAME:-}
+    restart: unless-stopped
