@@ -313,7 +313,7 @@ const isStreaming = ref(false)
 const streamText = ref('')
 const streamTokens = ref('')
 let abortController: AbortController | null = null
-let elapsedTimer: ReturnType<typeof setInterval> | null = null
+let elapsedTimer: ReturnType<typeof window.setInterval> | null = null
 const streamBodyRef = ref<HTMLElement | null>(null)
 
 /** 流式文本累计字节数 */
@@ -338,7 +338,7 @@ const highlightedStreamText = computed(() => {
 /** 启动已用时间计时器 */
 function startElapsedTimer() {
   elapsedSeconds.value = 0
-  elapsedTimer = window.setInterval(() => {
+  elapsedTimer = setInterval(() => {
     elapsedSeconds.value++
   }, 1000)
 }

@@ -216,8 +216,8 @@ onMounted(() => {
         const maxSceneId = Math.max(...parsed.script_scenes.map(s => s.scene_id))
         idCounter = maxSceneId + 1
       }
-      if (scriptData.value.script_scenes.length > 0) {
-        activeSceneId.value = scriptData.value.script_scenes[0].scene_id
+      if (parsed.script_scenes.length > 0) {
+        activeSceneId.value = parsed.script_scenes[0].scene_id
       }
     } catch {
       ElMessage.error('数据加载失败')
