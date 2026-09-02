@@ -510,10 +510,14 @@ function reattachToJob(jobId: string) {
   progressLogs.value = []
   totalChunks.value = 0
   completedChunks.value = 0
+  stopElapsedTimer()
   startElapsedTimer()
   addLog('start', `重新连接后台任务 ${jobId} ...`)
 
+  let pollInFlight = false
   const poll = async () => {
+    if (pollInFlight) return
+    pollInFlight = true
     try {
       const { job } = await getJob(jobId, true)
       if (!job) {
@@ -564,6 +568,8 @@ function reattachToJob(jobId: string) {
       }
     } catch {
       // 单次轮询失败忽略（网络抖动），下个周期重试
+    } finally {
+      pollInFlight = false
     }
   }
 
@@ -1008,7 +1014,7 @@ function handleProgressEvent(event: { stage: string; message: string; data: Reco
   if (stage === 'chunks_ready' && data.total) {
     totalChunks.value = data.total as number
   }
-  if (stage === 'chunk_done' && data.completed) {
+  if ((stage === 'chunk_done' || stage === 'chunk_resumed') && data.completed) {
     completedChunks.value = data.completed as number
   }
 

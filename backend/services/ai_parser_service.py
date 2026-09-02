@@ -416,22 +416,18 @@ def _parse_with_chunking(
         ctx = ChunkContext(
             chunk_index=chunk_index,
             total_chunks=total_chunks,
-            prev_summary=prev_summary,
-            id_offset=id_offset,
-            established_scenes=[
-                f"S{idx:02d}" for idx in range(1, id_offset)
-            ],
+                prev_summary=prev_summary,
+                id_offset=id_offset,
+                established_scenes=[
+                    f"S{idx:02d}" for idx in range(max(1, id_offset - 5), id_offset)
+                ],
             established_characters=list(char_cache.get_all_names()),
         )
 
         # 断点续跑：命中预加载分片时跳过 LLM 调用直接复用
-        if chunk_index in resume_map:
+        is_resumed = chunk_index in resume_map
+        if is_resumed:
             chunk_result = resume_map[chunk_index]
-            resumed_scenes = len(chunk_result.script_scenes)
-            _log(f"[AI] [RESUME] 分片 {chunk_index}/{total_chunks} 复用历史结果（{resumed_scenes} 场戏）")
-            _emit("chunk_resumed", {
-                "index": chunk_index, "total": total_chunks, "scenes": resumed_scenes,
-            })
         else:
             # 构建分片专用提示词
             system_prompt = _build_chunk_system_prompt(ctx, char_cache)
@@ -460,19 +456,28 @@ def _parse_with_chunking(
                         pass
                 continue
 
-        scene_count = len(chunk_result.script_scenes)
-        _log(f"[AI] [OK] 分片 {chunk_index}/{total_chunks} 解析成功（{scene_count} 场戏）")
-        _emit("chunk_done", {
-            "index": chunk_index, "total": total_chunks, "scenes": scene_count,
-            "completed": len(chunk_results) + 1,
-        })
-
-        # 实时落盘（复用的分片也写入本任务目录，保证进度统计与续跑链完整）
+        # 先落盘，再发送成功事件，避免出现“显示完成但结果未保存”的假进度。
         if chunk_sink:
             try:
                 chunk_sink(index=chunk_index, yaml_text=chunk_result.to_yaml())
             except Exception as sink_err:
-                _log(f"[AI] [WARN] 分片 {chunk_index} 落盘失败: {sink_err}")
+                _log(f"[AI] [FAIL] 分片 {chunk_index} 落盘失败: {sink_err}")
+                raise RuntimeError(f"分片 {chunk_index} 落盘失败: {sink_err}") from sink_err
+
+        scene_count = len(chunk_result.script_scenes)
+        completed_count = len(chunk_results) + 1
+        if is_resumed:
+            _log(f"[AI] [RESUME] 分片 {chunk_index}/{total_chunks} 复用历史结果（{scene_count} 场戏）")
+            _emit("chunk_resumed", {
+                "index": chunk_index, "total": total_chunks, "scenes": scene_count,
+                "completed": completed_count,
+            })
+        else:
+            _log(f"[AI] [OK] 分片 {chunk_index}/{total_chunks} 解析成功（{scene_count} 场戏）")
+            _emit("chunk_done", {
+                "index": chunk_index, "total": total_chunks, "scenes": scene_count,
+                "completed": completed_count,
+            })
 
         chunk_results.append(chunk_result)
 
@@ -813,6 +818,11 @@ def _calc_next_id_offset(chunk_result: ScriptYAML, current_offset: int) -> int:
     """
     计算下一个分片的ID起始偏移量。
 
+    模型有时会返回随机生成的超大 ID。不能直接使用模型返回的最大 ID，
+    否则后续构建上下文时会尝试创建数亿个场景编号，导致内存耗尽。
+    这里使用当前分片实际产生的 ID 数量作为安全的偏移步长；最终合并时
+    仍会重新排列所有 ID。
+
     Args:
         chunk_result: 当前分片的剧本数据
         current_offset: 当前偏移量
@@ -820,17 +830,11 @@ def _calc_next_id_offset(chunk_result: ScriptYAML, current_offset: int) -> int:
     Returns:
         int: 下一个分片应使用的ID起始值
     """
-    max_scene_id = max(
-        (s.scene_id for s in chunk_result.script_scenes), default=0
-    )
-    max_unit_id = 0
-    for scene in chunk_result.script_scenes:
-        for unit in scene.scene_content:
-            max_unit_id = max(max_unit_id, unit.unit_id)
-    max_char_id = max(
-        (c.char_id for c in chunk_result.global_characters), default=0
-    )
-    return current_offset + max(max_scene_id, max_unit_id, max_char_id)
+    scene_count = len(chunk_result.script_scenes)
+    unit_count = sum(len(scene.scene_content) for scene in chunk_result.script_scenes)
+    character_count = len(chunk_result.global_characters)
+    id_span = max(scene_count + unit_count + character_count, 1)
+    return current_offset + id_span
 
 
 def _merge_chunk_results(
@@ -1696,6 +1700,12 @@ def _call_llm(
                 f"[AI] [429-BACKOFF] 触发速率限制，等待 {wait_time:.1f}s 后重试 "
                 f"({retry + 1}/{RATE_LIMIT_MAX_RETRIES})"
             )
+            _emit_cb("llm_retry", {
+                "retry": retry + 1,
+                "max_retries": RATE_LIMIT_MAX_RETRIES,
+                "wait_seconds": wait_time,
+                "error_type": type(e).__name__,
+            })
             time.sleep(wait_time)
 
         except (APIConnectionError, APITimeoutError) as e:
@@ -1717,6 +1727,12 @@ def _call_llm(
                 f"等待 {wait_time:.1f}s 后重试 ({retry + 1}/{CONN_MAX_RETRIES}) | "
                 f"请求体约={total_bytes}B"
             )
+            _emit_cb("llm_retry", {
+                "retry": retry + 1,
+                "max_retries": CONN_MAX_RETRIES,
+                "wait_seconds": wait_time,
+                "error_type": err_type,
+            })
             time.sleep(wait_time)
 
         except Exception as e:
@@ -1738,6 +1754,12 @@ def _call_llm(
                     f"[AI] [429-BACKOFF] 网关限流({type(e).__name__})，等待 {wait_time:.1f}s 后重试 "
                     f"({retry + 1}/{RATE_LIMIT_MAX_RETRIES})"
                 )
+                _emit_cb("llm_retry", {
+                    "retry": retry + 1,
+                    "max_retries": RATE_LIMIT_MAX_RETRIES,
+                    "wait_seconds": wait_time,
+                    "error_type": type(e).__name__,
+                })
                 time.sleep(wait_time)
                 continue
 

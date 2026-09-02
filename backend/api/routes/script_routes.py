@@ -332,12 +332,24 @@ async def convert_novel_to_script_stream(
 
             # 使用 asyncio.Queue 实现线程→协程的高效事件传递
             event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+            last_job_heartbeat = 0.0
+
+            def enqueue_event(event: dict) -> None:
+                """从解析线程安全地把事件投递回事件循环线程"""
+                try:
+                    loop.call_soon_threadsafe(event_queue.put_nowait, event)
+                except RuntimeError:
+                    # 客户端断开且事件循环已关闭时，后台任务仍可继续落盘。
+                    pass
 
             def on_progress(event_type: str, data: dict) -> None:
                 """
                 AI 解析服务的进度回调。
-                通过 put_nowait 将事件推入异步队列（非阻塞），同时写入任务日志。
+                将事件推入异步队列（非阻塞），同时写入任务日志。
                 """
+                nonlocal last_job_heartbeat
+
                 stage_map = {
                     "start": ("parsing", f"开始AI解析... (文本长度: {data.get('text_length', '?')} 字)"),
                     "parsing_single": ("calling_llm", "正在调用 AI 模型进行单次解析..."),
@@ -350,8 +362,10 @@ async def convert_novel_to_script_stream(
                                      f"文本已切割为 {data.get('total', 0)} 个分片"),
                     "chunk_wait": ("waiting",
                                     f"等待速率限制冷却 ({data.get('wait_seconds', 2)}s)..."),
+                    "llm_retry": ("retrying",
+                                  f"LLM 请求重试中，等待 {data.get('wait_seconds', 0):.1f}s..."),
                     "chunk_start": ("chunk_start",
-                                    f"正在解析第 {data.get('index', '?')}/{data.get('total', '?')} 片..."),
+                                     f"正在解析第 {data.get('index', '?')}/{data.get('total', '?')} 片..."),
                     "chunk_done": ("chunk_done",
                                    f"第 {data.get('index', '?')}/{data.get('total', '?')} 片解析完成 "
                                    f"(+{data.get('scenes', 0)} 场戏)"),
@@ -374,6 +388,23 @@ async def convert_novel_to_script_stream(
                 }
                 stage, msg = stage_map.get(event_type, ("unknown", str(data)))
 
+                # 流式内容不写日志，但定期刷新 updated_at，避免长请求被判定为僵死。
+                if event_type == "stream_chunk":
+                    now = time.monotonic()
+                    if now - last_job_heartbeat >= 15:
+                        try:
+                            store.touch(job_id)
+                        except Exception:
+                            pass
+                        last_job_heartbeat = now
+
+                # 复用事件在分片已成功落盘后才发出，此时记录本次续跑范围。
+                if event_type == "chunk_resumed":
+                    try:
+                        store.mark_chunk_resumed(job_id, int(data.get("index", 0)))
+                    except Exception:
+                        pass
+
                 # 关键进度事件写入任务日志（断线重连后可见；流式chunk不记录避免刷盘）
                 if event_type not in ("stream_chunk",):
                     try:
@@ -388,15 +419,12 @@ async def convert_novel_to_script_stream(
                     except Exception:
                         pass
 
-                try:
-                    event_queue.put_nowait({
-                        "stage": stage,
-                        "message": msg,
-                        "data": data,
-                        "event_type": event_type,
-                    })
-                except Exception:
-                    pass
+                enqueue_event({
+                    "stage": stage,
+                    "message": msg,
+                    "data": data,
+                    "event_type": event_type,
+                })
 
             def chunk_sink(index: int, yaml_text: str | None = None, failed: bool = False) -> None:
                 """分片结果实时落盘 / 记录失败分片（断点续跑数据源）"""
@@ -434,7 +462,6 @@ async def convert_novel_to_script_stream(
             # ---- 步骤5：在线程池中运行同步 AI 解析 ----
             final_result: list[dict | None] = [None]
             final_error: list[dict | None] = [None]
-            loop = asyncio.get_event_loop()
 
             def run_parse():
                 """在独立线程中运行同步 AI 解析（结果实时落盘）"""
@@ -465,27 +492,22 @@ async def convert_novel_to_script_stream(
                 except JobCancelled:
                     store.mark_cancelled(job_id)
                     final_error[0] = {"type": "JobCancelled", "message": "任务已取消", "cancelled": True}
-                    try:
-                        event_queue.put_nowait({
-                            "stage": "cancelled",
-                            "message": "任务已取消",
-                            "data": {"job_id": job_id},
-                            "event_type": "cancelled",
-                        })
-                    except Exception:
-                        pass
+                    enqueue_event({
+                        "stage": "cancelled",
+                        "message": "任务已取消",
+                        "data": {"job_id": job_id},
+                        "event_type": "cancelled",
+                    })
                 except Exception as e:
                     store.mark_failed(job_id, f"[{type(e).__name__}] {str(e)}")
                     final_error[0] = {"type": type(e).__name__, "message": str(e)[:500]}
-                    try:
-                        event_queue.put_nowait({
-                            "stage": "error",
-                            "message": f"解析异常: [{type(e).__name__}] {str(e)[:200]}",
-                            "data": {"type": type(e).__name__, "message": str(e)[:300],
-                                     "job_id": job_id},
-                        })
-                    except Exception:
-                        pass
+                    enqueue_event({
+                        "stage": "error",
+                        "message": f"解析异常: [{type(e).__name__}] {str(e)[:200]}",
+                        "data": {"type": type(e).__name__, "message": str(e)[:300],
+                                 "job_id": job_id},
+                        "event_type": "error",
+                    })
 
             # 启动后台线程执行解析（客户端断线后线程继续运行，结果已落盘）
             parse_task = loop.run_in_executor(None, run_parse)
@@ -569,8 +591,14 @@ def _job_meta_response(meta: dict, include_result: bool = False) -> dict:
     Returns:
         dict: 对外响应（脱敏：不含 api_key）
     """
+    job_id = meta.get("job_id", "")
+    completed_indices = meta.get("completed_indices")
+    if completed_indices is None:
+        # 兼容旧任务：早期版本只保存了 completed_chunks，没有索引列表。
+        completed_indices = get_job_store().list_chunk_indices(job_id)
+
     resp = {
-        "job_id": meta.get("job_id"),
+        "job_id": job_id,
         "status": meta.get("status"),
         "novel_title": meta.get("novel_title"),
         "model_name": meta.get("model_name"),
@@ -578,6 +606,7 @@ def _job_meta_response(meta: dict, include_result: bool = False) -> dict:
         "updated_at": meta.get("updated_at"),
         "total_chunks": meta.get("total_chunks", 0),
         "completed_chunks": meta.get("completed_chunks", 0),
+        "completed_indices": completed_indices,
         "failed_chunks": meta.get("failed_chunks", []),
         "resumed_chunks": meta.get("resumed_chunks", []),
         "error": meta.get("error"),

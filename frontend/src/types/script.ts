@@ -155,6 +155,7 @@ export interface JobMeta {
   updated_at: number
   total_chunks: number
   completed_chunks: number
+  completed_indices: number[]
   failed_chunks: number[]
   resumed_chunks: number[]
   error: string | null

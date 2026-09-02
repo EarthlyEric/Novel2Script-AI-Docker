@@ -188,6 +188,7 @@ class JobStore:
             "updated_at": time.time(),
             "total_chunks": 0,
             "completed_chunks": 0,
+            "completed_indices": [],
             "failed_chunks": [],
             "resumed_chunks": [],
             "error": None,
@@ -250,13 +251,18 @@ class JobStore:
 
     def find_resumable_job(self, fingerprint: str) -> dict | None:
         """
-        查找指定指纹的最近一个可续跑任务（断点续跑来源）。
+        查找指定指纹的可续跑任务（断点续跑来源）。
 
         返回 failed / cancelled / completed 状态的任务，以及
         超过僵死阈值仍处于 running 的任务（进程中断后遗留）。
         completed 任务用于「相同请求直接返回缓存结果」。
+
+        对未完成任务优先选择已落盘分片最多的任务，避免一次较早失败的
+        重试覆盖掉另一个任务已经保存的更多进度。
         """
         now = time.time()
+        completed_candidates: list[dict] = []
+        resumable_candidates: list[dict] = []
         for meta in self.list_jobs(limit=50):
             if meta.get("fingerprint") != fingerprint:
                 continue
@@ -264,9 +270,23 @@ class JobStore:
             if status == STATUS_RUNNING:
                 # 仅僵死的 running 任务可续跑（活跃任务属于防重复范畴）
                 if now - meta.get("updated_at", 0) > STALE_RUNNING_SECONDS:
-                    return meta
+                    resumable_candidates.append(meta)
                 continue
-            return meta
+            if status == STATUS_COMPLETED:
+                completed_candidates.append(meta)
+            elif status in (STATUS_FAILED, STATUS_CANCELLED):
+                resumable_candidates.append(meta)
+
+        if completed_candidates:
+            return max(completed_candidates, key=lambda m: m.get("created_at", 0))
+        if resumable_candidates:
+            return max(
+                resumable_candidates,
+                key=lambda m: (
+                    len(self.list_chunk_indices(m.get("job_id", ""))),
+                    m.get("created_at", 0),
+                ),
+            )
         return None
 
     def load_request(self, job_id: str) -> dict | None:
@@ -311,6 +331,15 @@ class JobStore:
             meta["updated_at"] = time.time()
             self._write_json_atomic(self._meta_path(job_id), meta)
 
+    def touch(self, job_id: str) -> None:
+        """刷新任务心跳，不追加日志，供长时间流式请求使用"""
+        with self._lock:
+            meta = self._read_json(self._meta_path(job_id))
+            if meta is None:
+                return
+            meta["updated_at"] = time.time()
+            self._write_json_atomic(self._meta_path(job_id), meta)
+
     # --------------------------------------------------------
     # 分片持久化（断点续跑的数据来源）
     # --------------------------------------------------------
@@ -329,7 +358,9 @@ class JobStore:
             os.replace(tmp, self._chunk_path(job_id, index))
             meta = self._read_json(self._meta_path(job_id))
             if meta is not None:
-                meta["completed_chunks"] = len(self.list_chunk_indices(job_id))
+                completed_indices = self.list_chunk_indices(job_id)
+                meta["completed_chunks"] = len(completed_indices)
+                meta["completed_indices"] = completed_indices
                 meta["updated_at"] = time.time()
                 self._write_json_atomic(self._meta_path(job_id), meta)
 
