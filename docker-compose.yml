@@ -1,6 +1,6 @@
 services:
   novel2script:
-    image: ghcr.io/earthlyeric/novel2script-ai-docker:latest
+    image: ghcr.io/earthlyeric/novel2script-ai-docker:latest 
     container_name: novel2script-ai
     env_file: .env
     ports:
