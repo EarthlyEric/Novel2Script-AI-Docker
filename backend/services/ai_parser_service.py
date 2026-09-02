@@ -160,12 +160,19 @@ class ChunkContext:
 # ============================================================
 
 
+class JobCancelled(Exception):
+    """任务被用户取消时抛出（解析线程在分片间检查取消标记）"""
+
+
 def parse_novel_to_script(
     novel_text: str,
     novel_title: str,
     config: AIConfig | None = None,
     max_retries: int = 2,
     progress_callback=None,
+    chunk_sink=None,
+    resume_chunks: dict[int, "ScriptYAML"] | None = None,
+    cancel_check=None,
 ) -> ScriptYAML:
     """
     调用 AI 大模型将小说文本转换为结构化剧本。
@@ -186,6 +193,12 @@ def parse_novel_to_script(
                          event_type 包括: start/preprocessing/preprocessed/
                          extracting_chars/chars_extracted/chunking/chunks_ready/
                          chunk_start/chunk_done/chunk_fail/merging/done/error
+        chunk_sink: 可选回调 chunk_sink(chunk_index, chunk_result)，每个分片
+                    解析成功后立即调用（用于实时落盘，支持断点续跑）
+        resume_chunks: 可选的 {chunk_index(1基): ScriptYAML} 预加载分片。
+                       命中的分片跳过 LLM 调用直接复用（断点续跑）
+        cancel_check: 可选回调 cancel_check() -> bool，每个分片处理前调用，
+                      返回 True 时抛出 JobCancelled 终止解析
 
     Returns:
         ScriptYAML: 校验通过的结构化剧本数据
@@ -194,6 +207,7 @@ def parse_novel_to_script(
         ValueError: API Key 未配置时抛出
         ConnectionError: API 网络连接失败且重试耗尽时抛出
         RuntimeError: AI 返回数据始终无法通过 Schema 校验时抛出
+        JobCancelled: 用户取消任务时抛出
 
     Note:
         - 短文本（≤3500字）走单次调用路径
@@ -227,6 +241,8 @@ def parse_novel_to_script(
 
     # 短文本：直接单次调用
     if text_length <= CHUNK_SIZE:
+        if cancel_check and cancel_check():
+            raise JobCancelled("任务已取消")
         _emit("parsing_single", {"text_length": text_length})
         result = _parse_single_chunk(
             novel_text, novel_title, config, client, max_retries, progress_callback
@@ -242,7 +258,8 @@ def parse_novel_to_script(
     _log(f"[AI] AI配置: model={config.model_name}, base_url={config.base_url}, api_key={'***' if config.api_key else '(空)'}")
     _emit("parsing_chunks", {"text_length": text_length})
     result = _parse_with_chunking(
-        novel_text, novel_title, config, client, max_retries, progress_callback
+        novel_text, novel_title, config, client, max_retries, progress_callback,
+        chunk_sink=chunk_sink, resume_chunks=resume_chunks, cancel_check=cancel_check,
     )
     _emit("done", {
         "scenes": len(result.script_scenes),
@@ -324,6 +341,9 @@ def _parse_with_chunking(
     client: OpenAI,
     max_retries: int,
     progress_callback=None,
+    chunk_sink=None,
+    resume_chunks: dict[int, ScriptYAML] | None = None,
+    cancel_check=None,
 ) -> ScriptYAML:
     """
     长文本分片处理主流程。
@@ -331,7 +351,7 @@ def _parse_with_chunking(
     步骤：
     1. 前置人物预提取（全局人物缓存）
     2. 滑动分片切割
-    3. 逐片AI转换（注入人物缓存 + 上文摘要）
+    3. 逐片AI转换（注入人物缓存 + 上文摘要；命中 resume_chunks 的分片直接复用）
     4. 后端汇总合并（ID全局重排）
     5. 心理占比巡检
 
@@ -342,12 +362,16 @@ def _parse_with_chunking(
         client: OpenAI客户端
         max_retries: 最大重试次数
         progress_callback: 进度回调函数
+        chunk_sink: 可选回调 chunk_sink(chunk_index, chunk_result)，分片成功后调用
+        resume_chunks: 可选 {chunk_index: ScriptYAML} 预加载分片（断点续跑）
+        cancel_check: 可选回调 cancel_check() -> bool，分片间检查取消
 
     Returns:
         ScriptYAML: 合并后的完整结构化剧本数据
 
     Raises:
         RuntimeError: 所有分片均解析失败时抛出
+        JobCancelled: 用户取消任务时抛出
     """
     def _emit(event_type: str, data: dict | None = None) -> None:
         if progress_callback:
@@ -356,7 +380,14 @@ def _parse_with_chunking(
             except Exception:
                 pass
 
+    def _check_cancel() -> None:
+        """分片间协作式取消检查"""
+        if cancel_check and cancel_check():
+            _emit("cancelled", {"message": "任务已取消"})
+            raise JobCancelled("任务已取消")
+
     # 步骤1：前置人物预提取
+    _check_cancel()
     _emit("extracting_chars", {})
     char_cache = _extract_characters(novel_text, client, config)
     _emit("chars_extracted", {"char_count": len(char_cache.get_all_names())})
@@ -372,10 +403,14 @@ def _parse_with_chunking(
     chunk_results: list[ScriptYAML] = []
     prev_summary = ""
     id_offset = 1
+    resume_map = resume_chunks or {}
 
     for i, chunk_text in enumerate(chunks):
         chunk_index = i + 1
         total_chunks = len(chunks)
+
+        # 分片间取消检查
+        _check_cancel()
 
         # 构建分片上下文
         ctx = ChunkContext(
@@ -389,27 +424,41 @@ def _parse_with_chunking(
             established_characters=list(char_cache.get_all_names()),
         )
 
-        # 构建分片专用提示词
-        system_prompt = _build_chunk_system_prompt(ctx, char_cache)
-        user_message = _build_chunk_user_message(
-            chunk_text, novel_title, chunk_index, total_chunks
-        )
+        # 断点续跑：命中预加载分片时跳过 LLM 调用直接复用
+        if chunk_index in resume_map:
+            chunk_result = resume_map[chunk_index]
+            resumed_scenes = len(chunk_result.script_scenes)
+            _log(f"[AI] [RESUME] 分片 {chunk_index}/{total_chunks} 复用历史结果（{resumed_scenes} 场戏）")
+            _emit("chunk_resumed", {
+                "index": chunk_index, "total": total_chunks, "scenes": resumed_scenes,
+            })
+        else:
+            # 构建分片专用提示词
+            system_prompt = _build_chunk_system_prompt(ctx, char_cache)
+            user_message = _build_chunk_user_message(
+                chunk_text, novel_title, chunk_index, total_chunks
+            )
 
-        # 调用AI前等待，避免连续请求触发速率限制
-        if i > 0:
-            _log(f"[AI] [WAIT] 等待 {CHUNK_CALL_INTERVAL}s 后处理分片 {chunk_index}/{total_chunks} ...")
-            _emit("chunk_wait", {"index": chunk_index, "total": total_chunks, "wait_seconds": CHUNK_CALL_INTERVAL})
-            time.sleep(CHUNK_CALL_INTERVAL)
+            # 调用AI前等待，避免连续请求触发速率限制
+            if i > 0:
+                _log(f"[AI] [WAIT] 等待 {CHUNK_CALL_INTERVAL}s 后处理分片 {chunk_index}/{total_chunks} ...")
+                _emit("chunk_wait", {"index": chunk_index, "total": total_chunks, "wait_seconds": CHUNK_CALL_INTERVAL})
+                time.sleep(CHUNK_CALL_INTERVAL)
 
-        # 调用AI（带重试）
-        _emit("chunk_start", {"index": chunk_index, "total": total_chunks})
-        chunk_result = _parse_chunk_with_retry(
-            system_prompt, user_message, config, client, max_retries, progress_callback=_emit,
-        )
-        if chunk_result is None:
-            _log(f"[AI] [FAIL] 分片 {chunk_index}/{total_chunks} 解析失败，跳过")
-            _emit("chunk_fail", {"index": chunk_index, "total": total_chunks})
-            continue
+            # 调用AI（带重试）
+            _emit("chunk_start", {"index": chunk_index, "total": total_chunks})
+            chunk_result = _parse_chunk_with_retry(
+                system_prompt, user_message, config, client, max_retries, progress_callback=_emit,
+            )
+            if chunk_result is None:
+                _log(f"[AI] [FAIL] 分片 {chunk_index}/{total_chunks} 解析失败，跳过")
+                _emit("chunk_fail", {"index": chunk_index, "total": total_chunks})
+                if chunk_sink:
+                    try:
+                        chunk_sink(index=chunk_index, failed=True)
+                    except Exception:
+                        pass
+                continue
 
         scene_count = len(chunk_result.script_scenes)
         _log(f"[AI] [OK] 分片 {chunk_index}/{total_chunks} 解析成功（{scene_count} 场戏）")
@@ -417,6 +466,14 @@ def _parse_with_chunking(
             "index": chunk_index, "total": total_chunks, "scenes": scene_count,
             "completed": len(chunk_results) + 1,
         })
+
+        # 实时落盘（复用的分片也写入本任务目录，保证进度统计与续跑链完整）
+        if chunk_sink:
+            try:
+                chunk_sink(index=chunk_index, yaml_text=chunk_result.to_yaml())
+            except Exception as sink_err:
+                _log(f"[AI] [WARN] 分片 {chunk_index} 落盘失败: {sink_err}")
+
         chunk_results.append(chunk_result)
 
         # 提取摘要锚点
@@ -698,10 +755,14 @@ def _parse_chunk_with_retry(
         except Exception as e:
             last_error = e
             if attempt < max_retries:
+                # 重试间退避：校验类错误立即重试意义不大，但仍给 API 一点恢复时间；
+                # 限流/网络类错误在 _call_llm 内部已有更长退避，此处仅短暂等待
+                retry_wait = 1.5 * (attempt + 1)
                 _log(
-                    f"[AI] 分片重试 {attempt + 1}/{max_retries}: "
+                    f"[AI] 分片重试 {attempt + 1}/{max_retries}（{retry_wait}s 后）: "
                     f"{type(e).__name__}: {str(e)[:200]}"
                 )
+                time.sleep(retry_wait)
                 continue
             # 最终失败，打印完整错误
             _log(
@@ -1417,6 +1478,40 @@ def _build_user_message(novel_text: str, novel_title: str) -> str:
     )
 
 
+def _is_rate_limit_error(e: Exception) -> bool:
+    """
+    判断异常是否为速率限制类错误（含被代理层包装的情形）。
+
+    通过 LiteLLM / one-api 等网关转发时，上游 429 不会以
+    openai.RateLimitError 抛出，而是包装成通用 APIError，
+    错误文本中保留 RESOURCE_EXHAUSTED / RateLimitError / 429 等特征。
+
+    Args:
+        e: 待判断的异常
+
+    Returns:
+        bool: True 表示应按 429 处理（走指数退避重试）
+    """
+    # 显式状态码（openai.APIStatusError 及其子类）
+    status_code = getattr(e, "status_code", None)
+    if status_code == 429:
+        return True
+
+    # LiteLLM / 网关包装的错误文本特征
+    err_text = str(e)
+    markers = (
+        "RESOURCE_EXHAUSTED",
+        "RateLimitError",
+        "rate_limit",
+        "Rate limit",
+        "rate limit",
+        " Too many requests",
+        "Quota exceeded",
+        "quota exceeded",
+    )
+    return any(marker in err_text for marker in markers)
+
+
 def _call_llm(
     client: OpenAI,
     config: AIConfig,
@@ -1625,7 +1720,27 @@ def _call_llm(
             time.sleep(wait_time)
 
         except Exception as e:
-            """其他异常（参数错误、认证失败等）：不重试，记录后直接抛出"""
+            """其他异常：先识别被网关包装的 429 限流错误，其余不重试直接抛出"""
+            if _is_rate_limit_error(e):
+                if retry >= RATE_LIMIT_MAX_RETRIES:
+                    raise RuntimeError(
+                        f"API 速率限制(429/RESOURCE_EXHAUSTED，含网关包装)，"
+                        f"已退避重试 {RATE_LIMIT_MAX_RETRIES} 次仍失败: {str(e)[:200]}"
+                    ) from e
+
+                wait_time = _calc_backoff_with_jitter(
+                    base=RATE_LIMIT_BACKOFF_START,
+                    multiplier=2 ** retry,
+                    cap=RATE_LIMIT_BACKOFF_MAX,
+                    jitter_ratio=BACKOFF_JITTER_RATIO,
+                )
+                _log(
+                    f"[AI] [429-BACKOFF] 网关限流({type(e).__name__})，等待 {wait_time:.1f}s 后重试 "
+                    f"({retry + 1}/{RATE_LIMIT_MAX_RETRIES})"
+                )
+                time.sleep(wait_time)
+                continue
+
             err_type = type(e).__name__
             _log(
                 f"[AI] [ERR] LLM 调用异常（不可重试）| 类型={err_type} | "

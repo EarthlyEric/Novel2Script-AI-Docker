@@ -1,8 +1,14 @@
 services:
   novel2script:
-    image: ghcr.io/earthlyeric/novel2script-ai-docker:latest 
+    image: ghcr.io/earthlyeric/novel2script-ai-docker:latest
     container_name: novel2script-ai
     env_file: .env
     ports:
       - "8080:80"
     restart: unless-stopped
+    volumes:
+      # 转换任务数据持久化（断点续跑 / 预览兜底数据），容器重启不丢失
+      - app-data:/app/data
+
+volumes:
+  app-data:

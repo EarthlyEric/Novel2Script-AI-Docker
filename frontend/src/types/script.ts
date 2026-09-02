@@ -135,6 +135,45 @@ export interface ConfigStatus {
   model_name: string
 }
 
+/** 任务状态：running 转换中 / completed 已完成 / failed 失败 / cancelled 已取消 */
+export type JobStatus = 'running' | 'completed' | 'failed' | 'cancelled'
+
+/** 任务进度日志条目 */
+export interface JobLogEntry {
+  time: string
+  stage: string
+  message: string
+}
+
+/** 转换任务元数据（后端落盘任务的状态快照） */
+export interface JobMeta {
+  job_id: string
+  status: JobStatus
+  novel_title: string
+  model_name: string
+  created_at: number
+  updated_at: number
+  total_chunks: number
+  completed_chunks: number
+  failed_chunks: number[]
+  resumed_chunks: number[]
+  error: string | null
+  message: string
+  logs: JobLogEntry[]
+  /** 任务已完成且请求附带结果时存在 */
+  result?: JobResultPayload | null
+}
+
+/** 任务缓存结果载荷（result.json / SSE result 事件） */
+export interface JobResultPayload {
+  job_id: string
+  scenes: number
+  characters: number
+  script_data: ScriptYAML
+  yaml_text: string
+  message: string
+}
+
 /** 单元类型到中文标签的映射 */
 export const UNIT_TYPE_LABELS: Record<SceneContentUnit['unit_type'], string> = {
   action: '动作',

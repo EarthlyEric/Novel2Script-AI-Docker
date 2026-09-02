@@ -12,7 +12,7 @@
  * - POST /api/script/validate        — 校验YAML内容
  */
 import axios from 'axios'
-import type { ConvertParams, ConvertResult, ConfigStatus, ValidateResult } from '@/types/script'
+import type { ConvertParams, ConvertResult, ConfigStatus, JobMeta, ValidateResult } from '@/types/script'
 
 /**
  * axios 实例，配置基础URL、超时时间和拦截器
@@ -166,7 +166,10 @@ export async function convertNovelStream(
             break
 
           case 'error':
-            throw new Error(data.message || '转换过程中发生错误')
+            // 保留后端错误原始载荷（含 code: duplicate / job_id 等），供调用方精细化处理
+            throw Object.assign(new Error(data.message || '转换过程中发生错误'), {
+              payload: data,
+            })
 
           case 'heartbeat':
             // 心跳包，忽略
@@ -261,4 +264,37 @@ export async function testConnection(
  */
 export async function validateYaml(yamlText: string): Promise<ValidateResult> {
   return request.post('/script/validate', { yaml_text: yamlText })
+}
+
+/**
+ * 查询最近的转换任务状态
+ *
+ * 用于页面挂载时恢复后台任务进度 / 读取已完成结果（不再只依赖 sessionStorage）
+ *
+ * @param includeResult - 任务已完成时是否附带完整结果（script_data + yaml_text）
+ * @returns 最近任务 meta，无任务时 job 为 null
+ */
+export async function getLatestJob(includeResult = true): Promise<{ job: JobMeta | null }> {
+  return request.get('/script/jobs/latest', { params: { include_result: includeResult } })
+}
+
+/**
+ * 查询单个转换任务状态
+ *
+ * @param jobId - 任务 ID
+ * @param includeResult - 任务已完成时是否附带完整结果
+ * @returns 任务 meta
+ */
+export async function getJob(jobId: string, includeResult = true): Promise<{ job: JobMeta | null }> {
+  return request.get(`/script/jobs/${jobId}`, { params: { include_result: includeResult } })
+}
+
+/**
+ * 请求取消转换任务（协作式取消，后台线程在分片间停止）
+ *
+ * @param jobId - 任务 ID
+ * @returns 取消受理结果
+ */
+export async function cancelJob(jobId: string): Promise<{ success: boolean; message: string }> {
+  return request.post(`/script/jobs/${jobId}/cancel`)
 }

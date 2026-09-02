@@ -195,6 +195,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { ScriptYAML, ScriptScene, SceneContentUnit } from '@/types/script'
+import { getLatestJob } from '@/api/script'
 
 const router = useRouter()
 const scriptData = ref<ScriptYAML | null>(null)
@@ -206,7 +207,7 @@ const currentScene = computed<ScriptScene | undefined>(() => {
   return scriptData.value.script_scenes.find(s => s.scene_id === activeSceneId.value)
 })
 
-onMounted(() => {
+onMounted(async () => {
   const stored = sessionStorage.getItem('script_data')
   if (stored) {
     try {
@@ -222,6 +223,26 @@ onMounted(() => {
     } catch {
       ElMessage.error('数据加载失败')
     }
+    return
+  }
+
+  // sessionStorage 无数据时从后端最近已完成任务兜底加载
+  try {
+    const { job } = await getLatestJob(true)
+    if (job?.status === 'completed' && job.result?.script_data) {
+      const parsed = job.result.script_data as ScriptYAML
+      scriptData.value = JSON.parse(JSON.stringify(parsed))
+      if (parsed.script_scenes.length > 0) {
+        const maxSceneId = Math.max(...parsed.script_scenes.map(s => s.scene_id))
+        idCounter = maxSceneId + 1
+        activeSceneId.value = parsed.script_scenes[0].scene_id
+      }
+      sessionStorage.setItem('script_data', JSON.stringify(parsed))
+      if (job.result.yaml_text) sessionStorage.setItem('yaml_text', job.result.yaml_text)
+      ElMessage.success('已从后端加载最近一次转换结果')
+    }
+  } catch {
+    // 后端不可用时保持空状态
   }
 })
 

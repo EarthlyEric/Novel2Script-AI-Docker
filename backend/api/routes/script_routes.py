@@ -21,10 +21,20 @@ from backend.config import AIConfig
 from backend.schemas.script_schema import (
     ConvertRequest,
     ConvertResponse,
+    ScriptYAML,
     ValidateRequest,
     ValidateResponse,
 )
-from backend.services.ai_parser_service import parse_novel_to_script
+from backend.services.ai_parser_service import (
+    JobCancelled,
+    parse_novel_to_script,
+)
+from backend.services.job_store import (
+    STATUS_COMPLETED,
+    STATUS_RUNNING,
+    compute_fingerprint,
+    get_job_store,
+)
 from backend.services.text_preprocessor import preprocess_novel_text
 from backend.services.yaml_renderer import render_script_yaml
 
@@ -216,15 +226,21 @@ async def convert_novel_to_script_stream(
     api_key: str = Form(default="", description="可选：自定义API Key"),
     base_url: str = Form(default="", description="可选：自定义API地址"),
     model_name: str = Form(default="", description="可选：自定义模型名称"),
+    force: bool = Form(default=False, description="可选：忽略缓存结果强制重新转换"),
 ):
     """
-    SSE 流式转换接口 — 实时推送解析进度。
+    SSE 流式转换接口 — 实时推送解析进度（任务制）。
 
-    返回 text/event-stream 格式，前端可通过 fetch ReadableStream 或 EventSource 接收。
-    事件类型：
+    任务在后台线程运行并实时落盘（job_store），即使客户端断线 /
+    刷新页面 / 服务重启前的中断，已完成分片都不会丢失：
+    - 防重复：相同指纹任务进行中时返回 duplicate 错误（含 job_id）
+    - 缓存直返：相同指纹任务已完成且未指定 force 时，直接返回缓存结果
+    - 断点续跑：相同指纹的历史失败/取消任务，已完成分片自动复用
+
+    返回 text/event-stream 格式，事件类型：
       - progress: 进度更新（含 stage/message/data）
-      - result:   转换完成（含完整 data 和 yaml_text）
-      - error:    错误信息
+      - result:   转换完成（含完整 data 和 yaml_text 及 job_id）
+      - error:    错误信息（含 code: duplicate 等）
     """
     import asyncio
 
@@ -234,12 +250,17 @@ async def convert_novel_to_script_stream(
 
     async def event_generator():
         """异步生成器，通过 asyncio.Queue 实时产出 SSE 事件"""
+        store = get_job_store()
+        job_id: str | None = None
+
         try:
             # ---- 步骤1：获取原始文本 ----
             raw_text = ""
+            file_content = ""
             if novel_file and novel_file.filename:
                 content = await novel_file.read()
-                raw_text = content.decode("utf-8", errors="ignore")
+                file_content = content.decode("utf-8", errors="ignore")
+                raw_text = file_content
                 log(f"[STREAM] 收到文件上传: {novel_file.filename}, 大小: {len(content)} 字节")
             elif novel_text and novel_text.strip():
                 raw_text = novel_text.strip()
@@ -248,13 +269,74 @@ async def convert_novel_to_script_stream(
                 yield _sse_event("error", {"message": "请提供小说正文文本或上传文件"})
                 return
 
+            # ---- 步骤2：AI配置与文本指纹 ----
+            config = AIConfig(
+                api_key=api_key or "",
+                base_url=base_url or "",
+                model_name=model_name or "",
+            )
+            fingerprint = compute_fingerprint(raw_text, config.model_name, config.base_url)
+            log(f"[STREAM] 文本指纹: {fingerprint[:16]}... model={config.model_name}")
+
+            # ---- 防重复提交：相同指纹任务进行中时拒绝 ----
+            running = store.find_running_job(fingerprint)
+            if running:
+                log(f"[STREAM] 检测到相同任务进行中: {running['job_id']}，拒绝重复提交")
+                yield _sse_event("error", {
+                    "code": "duplicate",
+                    "job_id": running["job_id"],
+                    "message": f"相同文本的转换任务正在进行中（{running['job_id']}），"
+                               f"请等待其完成或取消后再试",
+                })
+                return
+
+            # ---- 缓存直返：相同指纹已完成且未强制重跑 ----
+            if not force:
+                completed = store.find_resumable_job(fingerprint)
+                if completed and completed.get("status") == STATUS_COMPLETED:
+                    cached = store.load_result(completed["job_id"])
+                    if cached:
+                        log(f"[STREAM] 命中已完成任务缓存: {completed['job_id']}，直接返回")
+                        yield _sse_event("result", cached)
+                        return
+
+            # ---- 断点续跑：从最近一次同指纹任务加载已完成分片 ----
+            resume_chunks: dict[int, ScriptYAML] = {}
+            resumable = store.find_resumable_job(fingerprint)
+            if resumable:
+                prev_job_id = resumable["job_id"]
+                for idx in store.list_chunk_indices(prev_job_id):
+                    yaml_text_prev = store.get_chunk_yaml(prev_job_id, idx)
+                    if not yaml_text_prev:
+                        continue
+                    try:
+                        resume_chunks[idx] = ScriptYAML.from_yaml(yaml_text_prev)
+                    except Exception:
+                        continue  # 历史分片损坏时丢弃，重新解析该分片
+                if resume_chunks:
+                    log(f"[STREAM] 断点续跑: 复用任务 {prev_job_id} 的 "
+                        f"{len(resume_chunks)} 个已完成分片")
+
+            # ---- 步骤3：创建任务并持久化 ----
+            job = store.create_job(
+                novel_title=novel_title,
+                novel_text=novel_text,
+                novel_file_content=file_content,
+                api_key=config.api_key,
+                base_url=config.base_url,
+                model_name=config.model_name,
+                fingerprint=fingerprint,
+            )
+            job_id = job["job_id"]
+            log(f"[STREAM] 任务已创建: {job_id}")
+
             # 使用 asyncio.Queue 实现线程→协程的高效事件传递
             event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
 
             def on_progress(event_type: str, data: dict) -> None:
                 """
                 AI 解析服务的进度回调。
-                通过 put_nowait 将事件推入异步队列（非阻塞）。
+                通过 put_nowait 将事件推入异步队列（非阻塞），同时写入任务日志。
                 """
                 stage_map = {
                     "start": ("parsing", f"开始AI解析... (文本长度: {data.get('text_length', '?')} 字)"),
@@ -273,6 +355,9 @@ async def convert_novel_to_script_stream(
                     "chunk_done": ("chunk_done",
                                    f"第 {data.get('index', '?')}/{data.get('total', '?')} 片解析完成 "
                                    f"(+{data.get('scenes', 0)} 场戏)"),
+                    "chunk_resumed": ("chunk_resumed",
+                                      f"第 {data.get('index', '?')}/{data.get('total', '?')} 片复用历史结果 "
+                                      f"(+{data.get('scenes', 0)} 场戏)"),
                     "chunk_fail": ("chunk_fail",
                                    f"第 {data.get('index', '?')}/{data.get('total', '?')} 片解析失败，跳过"),
                     "merging": ("merging",
@@ -288,6 +373,21 @@ async def convert_novel_to_script_stream(
                                      f" | tokens={data.get('total_tokens', 'N/A')}"),
                 }
                 stage, msg = stage_map.get(event_type, ("unknown", str(data)))
+
+                # 关键进度事件写入任务日志（断线重连后可见；流式chunk不记录避免刷盘）
+                if event_type not in ("stream_chunk",):
+                    try:
+                        store.append_log(job_id, stage, msg)
+                    except Exception:
+                        pass
+
+                # 分片切割完成时记录总数（前端轮询进度条需要）
+                if event_type == "chunks_ready":
+                    try:
+                        store.set_total_chunks(job_id, int(data.get("total", 0)))
+                    except Exception:
+                        pass
+
                 try:
                     event_queue.put_nowait({
                         "stage": stage,
@@ -298,14 +398,26 @@ async def convert_novel_to_script_stream(
                 except Exception:
                     pass
 
-            # 发送初始进度
+            def chunk_sink(index: int, yaml_text: str | None = None, failed: bool = False) -> None:
+                """分片结果实时落盘 / 记录失败分片（断点续跑数据源）"""
+                if failed:
+                    store.mark_chunk_failed(job_id, index)
+                elif yaml_text:
+                    store.save_chunk(job_id, index, yaml_text)
+
+            def cancel_check() -> bool:
+                """分片间协作式取消检查"""
+                return store.is_cancel_requested(job_id)
+
+            # 发送初始进度（携带 job_id 供前端断线重连）
             yield _sse_event("progress", {
                 "stage": "preprocessing",
                 "message": f"正在预处理文本（{len(raw_text)} 字符）...",
-                "data": {"text_length": len(raw_text)},
+                "data": {"text_length": len(raw_text), "job_id": job_id,
+                         "resumed_chunks": len(resume_chunks)},
             })
 
-            # ---- 步骤2：文本预处理 ----
+            # ---- 步骤4：文本预处理 ----
             log(f"[STREAM] 开始预处理，输入长度: {len(raw_text)} 字符")
             preprocess_result = preprocess_novel_text(raw_text)
             log(f"[STREAM] 预处理完成: 章节范围={preprocess_result.chapter_range}")
@@ -315,51 +427,67 @@ async def convert_novel_to_script_stream(
                 "data": {
                     "chapter_range": preprocess_result.chapter_range,
                     "output_length": len(preprocess_result.clean_text),
+                    "job_id": job_id,
                 },
             })
 
-            # ---- 步骤3：构建AI配置 ----
-            config = AIConfig(
-                api_key=api_key or "",
-                base_url=base_url or "",
-                model_name=model_name or "",
-            )
-            log(f"[STREAM] AI配置: model={config.model_name}")
-
-            # ---- 步骤4：在线程池中运行同步 AI 解析 ----
+            # ---- 步骤5：在线程池中运行同步 AI 解析 ----
             final_result: list[dict | None] = [None]
             final_error: list[dict | None] = [None]
             loop = asyncio.get_event_loop()
 
             def run_parse():
-                """在独立线程中运行同步 AI 解析"""
+                """在独立线程中运行同步 AI 解析（结果实时落盘）"""
                 try:
                     script_data = parse_novel_to_script(
                         novel_text=preprocess_result.clean_text,
                         novel_title=novel_title,
                         config=config,
                         progress_callback=on_progress,
+                        chunk_sink=chunk_sink,
+                        resume_chunks=resume_chunks or None,
+                        cancel_check=cancel_check,
                     )
                     script_data.script_meta.chapter_range = preprocess_result.chapter_range
                     yaml_text = render_script_yaml(script_data)
-                    final_result[0] = {
+                    result_payload = {
+                        "job_id": job_id,
                         "scenes": len(script_data.script_scenes),
                         "characters": len(script_data.global_characters),
                         "script_data": script_data.model_dump(mode="python"),
                         "yaml_text": yaml_text,
+                        "message": f"成功转换，共生成 {len(script_data.script_scenes)} 场戏、"
+                                   f"{len(script_data.global_characters)} 个角色",
                     }
+                    # 完整结果落盘（预览页可从后端读取）
+                    store.finalize_result(job_id, result_payload, yaml_text)
+                    final_result[0] = result_payload
+                except JobCancelled:
+                    store.mark_cancelled(job_id)
+                    final_error[0] = {"type": "JobCancelled", "message": "任务已取消", "cancelled": True}
+                    try:
+                        event_queue.put_nowait({
+                            "stage": "cancelled",
+                            "message": "任务已取消",
+                            "data": {"job_id": job_id},
+                            "event_type": "cancelled",
+                        })
+                    except Exception:
+                        pass
                 except Exception as e:
+                    store.mark_failed(job_id, f"[{type(e).__name__}] {str(e)}")
                     final_error[0] = {"type": type(e).__name__, "message": str(e)[:500]}
                     try:
                         event_queue.put_nowait({
                             "stage": "error",
                             "message": f"解析异常: [{type(e).__name__}] {str(e)[:200]}",
-                            "data": {"type": type(e).__name__, "message": str(e)[:300]},
+                            "data": {"type": type(e).__name__, "message": str(e)[:300],
+                                     "job_id": job_id},
                         })
                     except Exception:
                         pass
 
-            # 启动后台线程执行解析
+            # 启动后台线程执行解析（客户端断线后线程继续运行，结果已落盘）
             parse_task = loop.run_in_executor(None, run_parse)
 
             # 从队列读取事件并推送给客户端（实时、低延迟）
@@ -390,7 +518,7 @@ async def convert_novel_to_script_stream(
 
                     # 心跳：每 5s 发一次 keepalive（比之前 15s 更频繁）
                     if time.time() - last_heartbeat > 5:
-                        yield _sse_event("heartbeat", {})
+                        yield _sse_event("heartbeat", {"job_id": job_id})
                         last_heartbeat = time.time()
 
             # 等待任务完成确保无遗漏
@@ -407,9 +535,11 @@ async def convert_novel_to_script_stream(
         except Exception as e:
             err_type = type(e).__name__
             log(f"[STREAM] 异常({err_type}): {str(e)[:500]}")
+            # 任务已在后台线程负责标记状态；此处仅向前端报告
             yield _sse_event("error", {
                 "type": err_type,
                 "message": f"服务器内部错误: {str(e)[:300]}",
+                "job_id": job_id,
             })
 
     return StreamingResponse(
@@ -421,6 +551,102 @@ async def convert_novel_to_script_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ============================================================
+# 任务查询与管理接口
+# ============================================================
+
+
+def _job_meta_response(meta: dict, include_result: bool = False) -> dict:
+    """
+    组装任务 meta 的对外响应。
+
+    Args:
+        meta: job_store 的 meta dict
+        include_result: 是否附带已完成任务的完整结果
+
+    Returns:
+        dict: 对外响应（脱敏：不含 api_key）
+    """
+    resp = {
+        "job_id": meta.get("job_id"),
+        "status": meta.get("status"),
+        "novel_title": meta.get("novel_title"),
+        "model_name": meta.get("model_name"),
+        "created_at": meta.get("created_at"),
+        "updated_at": meta.get("updated_at"),
+        "total_chunks": meta.get("total_chunks", 0),
+        "completed_chunks": meta.get("completed_chunks", 0),
+        "failed_chunks": meta.get("failed_chunks", []),
+        "resumed_chunks": meta.get("resumed_chunks", []),
+        "error": meta.get("error"),
+        "message": meta.get("message", ""),
+        "logs": meta.get("logs", []),
+    }
+    if include_result:
+        result = get_job_store().load_result(meta.get("job_id", ""))
+        resp["result"] = result
+    return resp
+
+
+@router.get("/jobs")
+async def list_jobs():
+    """列出最近的转换任务（按创建时间倒序，最多20条，不含结果正文）"""
+    return {"jobs": [_job_meta_response(m) for m in get_job_store().list_jobs(limit=20)]}
+
+
+@router.get("/jobs/latest")
+async def get_latest_job(include_result: bool = True):
+    """
+    获取最近一个任务的状态（可选附带结果）。
+
+    Args:
+        include_result: 任务已完成时是否附带完整结果（script_data + yaml_text）
+
+    Returns:
+        dict: 任务 meta（无任务时 jobs 为空）
+    """
+    meta = get_job_store().latest_job()
+    if not meta:
+        return {"job": None}
+    return {"job": _job_meta_response(meta, include_result=include_result)}
+
+
+@router.get("/jobs/{job_id}")
+async def get_job_detail(job_id: str, include_result: bool = False):
+    """
+    查询单个任务详情（可选附带结果）。
+
+    Raises:
+        HTTPException 404: 任务不存在
+    """
+    meta = get_job_store().get_job(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"任务不存在: {job_id}")
+    return {"job": _job_meta_response(meta, include_result=include_result)}
+
+
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """
+    请求取消任务（协作式：解析线程在分片间检查取消标记）。
+
+    Raises:
+        HTTPException 404: 任务不存在
+        HTTPException 409: 任务已结束（非 running 状态）
+    """
+    ok = get_job_store().request_cancel(job_id)
+    if not ok:
+        meta = get_job_store().get_job(job_id)
+        if not meta:
+            raise HTTPException(status_code=404, detail=f"任务不存在: {job_id}")
+        raise HTTPException(
+            status_code=409,
+            detail=f"任务 {job_id} 已结束（{meta.get('status')}），无需取消",
+        )
+    log(f"[STREAM] 任务取消请求已受理: {job_id}")
+    return {"success": True, "message": f"任务 {job_id} 取消请求已受理，将在当前分片完成后停止"}
 
 
 @router.post("/test-connection")

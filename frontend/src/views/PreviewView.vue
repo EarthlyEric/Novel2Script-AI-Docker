@@ -120,6 +120,7 @@ import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { ScriptYAML } from '@/types/script'
+import { getLatestJob } from '@/api/script'
 import SceneCard from '@/components/SceneCard.vue'
 import CharacterTag from '@/components/CharacterTag.vue'
 
@@ -127,7 +128,7 @@ const router = useRouter()
 const scriptData = ref<ScriptYAML | null>(null)
 const yamlText = ref('')
 
-onMounted(() => {
+onMounted(async () => {
   const stored = sessionStorage.getItem('script_data')
   if (stored) {
     try {
@@ -136,6 +137,22 @@ onMounted(() => {
     } catch {
       ElMessage.error('数据格式异常，请重新转换')
     }
+    return
+  }
+
+  // sessionStorage 无数据时从后端最近已完成任务兜底加载
+  try {
+    const { job } = await getLatestJob(true)
+    if (job?.status === 'completed' && job.result?.script_data) {
+      scriptData.value = job.result.script_data
+      yamlText.value = job.result.yaml_text || ''
+      sessionStorage.setItem('script_data', JSON.stringify(job.result.script_data))
+      if (job.result.yaml_text) sessionStorage.setItem('yaml_text', job.result.yaml_text)
+    } else if (job?.status === 'running') {
+      ElMessage.info('转换任务正在进行中，完成后即可在此预览')
+    }
+  } catch {
+    // 后端不可用时保持空状态
   }
 })
 

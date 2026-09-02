@@ -137,3 +137,8 @@ text/
 # Docker
 # =========================
 docker-compose.override.yml
+
+# 本地运行时生成的任务数据与前端构建产物
+/data/
+frontend/vite.config.js
+frontend/vite.config.d.ts

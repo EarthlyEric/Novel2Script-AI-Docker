@@ -103,7 +103,21 @@ class SceneAttr(BaseModel):
             if keyword in v:
                 return target
 
-        raise ValueError(f"scene_type 必须为 {allowed} 之一（已尝试模糊匹配），当前值: {v}")
+        # 兜底降级：无法识别时按「内景」处理，避免因单个字段异常丢弃整个分片
+        return "内景"
+
+    @staticmethod
+    def _match_time_keyword(v_lower: str) -> str | None:
+        """按关键词包含顺序匹配时间段；命中返回合法值，未命中返回 None"""
+        for keyword, target in [
+            ("凌晨", "凌晨"), ("黎明", "凌晨"), ("DAWN", "DAWN"), ("dawn", "DAWN"),
+            ("黄昏", "黄昏"), ("傍晚", "黄昏"), ("DUSK", "DUSK"), ("dusk", "DUSK"),
+            ("夜", "夜"), ("夜晚", "夜"), ("NIGHT", "NIGHT"), ("night", "NIGHT"),
+            ("日", "日"), ("白天", "日"), ("DAY", "DAY"), ("day", "DAY"),
+        ]:
+            if keyword in v_lower:
+                return target
+        return None
 
     @field_validator("time_type")
     @classmethod
@@ -131,40 +145,44 @@ class SceneAttr(BaseModel):
             "黎明": "凌晨",
             "清晨": "日",
             "早晨": "日",
+            "早上": "日",
             "上午": "日",
             "中午": "日",
+            "午后": "日",
             "下午": "日",
             "傍晚": "黄昏",
             "傍晚至夜间": "黄昏",
             "晚间": "夜",
+            "晚上": "夜",
             "深夜": "夜",
             "午夜": "夜",
+            "半夜": "夜",
+            "暗": "夜",
+            "黑夜": "夜",
+            "夜晚": "夜",
             "深夜至凌晨": "凌晨",
             "白天": "日",
-            "黑夜": "夜",
             "白天至夜晚": "日",
+            "黄昏至夜晚": "黄昏",
             "dawn": "DAWN",
             "morning": "DAY",
             "afternoon": "DAY",
             "evening": "DUSK",
             "night": "NIGHT",
             "midnight": "NIGHT",
+            "dark": "NIGHT",
         }
         v_lower = v.strip()
         if v_lower in fuzzy_map:
             return fuzzy_map[v_lower]
 
         # 关键词包含匹配
-        for keyword, target in [
-            ("凌晨", "凌晨"), ("黎明", "凌晨"), ("DAWN", "DAWN"), ("dawn", "DAWN"),
-            ("黄昏", "黄昏"), ("傍晚", "黄昏"), ("DUSK", "DUSK"), ("dusk", "DUSK"),
-            ("夜", "夜"), ("夜晚", "夜"), ("NIGHT", "NIGHT"), ("night", "NIGHT"),
-            ("日", "日"), ("白天", "日"), ("DAY", "DAY"), ("day", "DAY"),
-        ]:
-            if keyword in v_lower:
-                return target
+        matched = cls._match_time_keyword(v_lower)
+        if matched:
+            return matched
 
-        raise ValueError(f"time_type 必须为 {allowed} 之一（已尝试模糊匹配），当前值: {v}")
+        # 兜底降级：无法识别时按「日」处理，避免因单个字段异常丢弃整个分片
+        return "日"
 
 
 class SceneContentUnit(BaseModel):

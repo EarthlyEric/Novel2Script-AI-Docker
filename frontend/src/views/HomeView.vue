@@ -31,6 +31,63 @@
       </div>
     </section>
 
+    <!-- 最近任务横幅（后台任务恢复 / 已完成结果提示） -->
+    <transition name="progress-fade">
+      <div
+        v-if="recentJob && !converting && !bannerDismissed"
+        class="job-banner"
+        :class="'banner-' + recentJob.status"
+      >
+        <div class="banner-icon">
+          <!-- running：旋转圈 -->
+          <svg v-if="recentJob.status === 'running'" class="icon-spin" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-dasharray="48" stroke-dashoffset="16"><animate attributeName="stroke-dashoffset" values="48;0" dur="1.2s" repeatCount="indefinite"/></circle></svg>
+          <!-- completed：对勾 -->
+          <svg v-else-if="recentJob.status === 'completed'" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+          <!-- failed / cancelled：警告 -->
+          <svg v-else width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </div>
+
+        <div class="banner-body">
+          <div v-if="recentJob.status === 'running'" class="banner-title">
+            后台转换任务进行中 — {{ recentJob.novel_title }}
+            <span class="banner-progress">{{ recentJob.completed_chunks }}/{{ recentJob.total_chunks || '?' }} 片</span>
+          </div>
+          <div v-else-if="recentJob.status === 'completed'" class="banner-title">
+            转换已完成 — {{ recentJob.novel_title }}
+          </div>
+          <div v-else-if="recentJob.status === 'failed'" class="banner-title">
+            上次转换失败 — {{ recentJob.novel_title }}
+          </div>
+          <div v-else class="banner-title">
+            上次转换已取消 — {{ recentJob.novel_title }}
+          </div>
+
+          <div class="banner-desc">
+            <template v-if="recentJob.status === 'running'">
+              后台正在继续解析，刷新或关闭页面不会中断任务
+            </template>
+            <template v-else-if="recentJob.status === 'completed'">
+              已生成完整剧本，可直接查看预览
+            </template>
+            <template v-else>
+              {{ recentJob.error || '原因未知' }}。重新提交相同文本时将自动复用已完成的
+              {{ recentJob.completed_chunks }} 个分片，无需从头再跑
+            </template>
+          </div>
+        </div>
+
+        <div class="banner-actions">
+          <button v-if="recentJob.status === 'running'" class="banner-btn ghost" @click="cancelRecentJob">
+            取消任务
+          </button>
+          <button v-if="recentJob.status === 'completed'" class="banner-btn primary" @click="viewJobResult">
+            查看预览
+          </button>
+          <button class="banner-btn ghost" @click="dismissBanner">忽略</button>
+        </div>
+      </div>
+    </transition>
+
     <!-- 主表单卡片 -->
     <section class="form-section">
       <div class="form-card">
@@ -295,8 +352,8 @@
 import { ref, reactive, computed, nextTick, onMounted, onUnmounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
-import { convertNovelStream, testConnection, getConfigStatus } from '@/api/script'
-import type { ConfigStatus } from '@/types/script'
+import { convertNovelStream, testConnection, getConfigStatus, getLatestJob, getJob, cancelJob } from '@/api/script'
+import type { ConfigStatus, JobMeta, JobResultPayload } from '@/types/script'
 import JSZip from 'jszip'
 
 const router = useRouter()
@@ -327,6 +384,28 @@ const streamTokens = ref('')
 let abortController: AbortController | null = null
 let elapsedTimer: ReturnType<typeof window.setInterval> | null = null
 const streamBodyRef = ref<HTMLElement | null>(null)
+
+// === 后端任务（断线重连 / 后台任务恢复）===
+/** 当前运行中任务的 job_id（提交后由 SSE 事件带回） */
+const currentJobId = ref<string | null>(null)
+/** 最近一次后端任务（用于页面挂载时恢复进度 / 提示已完成结果） */
+const recentJob = ref<JobMeta | null>(null)
+/** 轮询定时器 */
+let pollTimer: ReturnType<typeof window.setInterval> | null = null
+/** 是否处于「断线重连」轮询模式（SSE 丢失但后台任务仍在跑） */
+const reattaching = ref(false)
+
+/** 横幅是否被用户忽略（按 job_id 记忆，新任务出现时重新显示） */
+const bannerDismissed = computed(() => {
+  const id = recentJob.value?.job_id
+  if (!id) return true
+  return localStorage.getItem(`dismissed_job_${id}`) === '1'
+})
+
+/** 后台任务是否仍在运行（轮询期间视为运行中） */
+const recentJobActive = computed(() =>
+  recentJob.value?.status === 'running' || reattaching.value
+)
 
 /** 流式文本累计字节数 */
 const streamLength = computed(() => new TextEncoder().encode(streamText.value).length)
@@ -390,7 +469,168 @@ onMounted(async () => {
     // 查询失败按未配置处理，不影响表单手动填写
     serverConfig.value = { configured: false, api_key_masked: '', base_url: '', model_name: '' }
   }
+
+  // 查询后端最近任务：有进行中的任务则自动重连进度
+  try {
+    const { job } = await getLatestJob(false)
+    if (job) {
+      recentJob.value = job
+      if (job.status === 'running') {
+        reattachToJob(job.job_id)
+      }
+    }
+  } catch {
+    // 后端不可用时静默忽略，不影响表单
+  }
+
+  // 刷新/关闭页面前给出确认提示，避免误操作中断进度查看
+  window.addEventListener('beforeunload', handleBeforeUnload)
 })
+
+/** 转换进行中时拦截页面关闭/刷新 */
+function handleBeforeUnload(e: BeforeUnloadEvent) {
+  if (converting.value || reattaching.value) {
+    e.preventDefault()
+    e.returnValue = ''
+  }
+}
+
+/**
+ * 重连后台任务：切换为轮询模式跟踪任务进度。
+ * 适用场景：页面刷新后恢复进度 / SSE 意外断开 / 处理 duplicate 提示。
+ */
+function reattachToJob(jobId: string) {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+  currentJobId.value = jobId
+  reattaching.value = true
+  converting.value = true
+  progressLogs.value = []
+  totalChunks.value = 0
+  completedChunks.value = 0
+  startElapsedTimer()
+  addLog('start', `重新连接后台任务 ${jobId} ...`)
+
+  const poll = async () => {
+    try {
+      const { job } = await getJob(jobId, true)
+      if (!job) {
+        stopPolling()
+        addLog('error', '后台任务不存在（可能已被清理）')
+        converting.value = false
+        reattaching.value = false
+        return
+      }
+      recentJob.value = job
+      totalChunks.value = job.total_chunks || 0
+      completedChunks.value = job.completed_chunks || 0
+
+      // 同步后端任务日志到进度面板
+      const remoteLogs = (job.logs || []).map((l) => ({
+        time: l.time,
+        stage: l.stage,
+        message: l.message,
+      }))
+      if (remoteLogs.length > progressLogs.value.length) {
+        progressLogs.value = remoteLogs
+        nextTick(() => {
+          if (logContainerRef.value) {
+            logContainerRef.value.scrollTop = logContainerRef.value.scrollHeight
+          }
+        })
+      }
+      const lastLog = remoteLogs[remoteLogs.length - 1]
+      currentStage.value = lastLog?.message || '后台任务运行中...'
+
+      if (job.status === 'completed' && job.result) {
+        stopPolling()
+        addLog('done', '后台任务已完成！')
+        handleJobResult(job.result)
+        converting.value = false
+        reattaching.value = false
+      } else if (job.status === 'failed') {
+        stopPolling()
+        addLog('error', `后台任务失败: ${job.error || '未知错误'}`)
+        ElMessage.error(`转换任务失败: ${job.error || '未知错误'}`)
+        converting.value = false
+        reattaching.value = false
+      } else if (job.status === 'cancelled') {
+        stopPolling()
+        addLog('cancelled', '后台任务已取消')
+        converting.value = false
+        reattaching.value = false
+      }
+    } catch {
+      // 单次轮询失败忽略（网络抖动），下个周期重试
+    }
+  }
+
+  poll()
+  pollTimer = setInterval(poll, 2000)
+}
+
+/** 停止轮询定时器 */
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+  stopElapsedTimer()
+}
+
+/**
+ * 将任务结果写入 sessionStorage 并跳转预览页
+ * （SSE 完成与轮询恢复两条路径共用）
+ */
+function handleJobResult(result: JobResultPayload) {
+  sessionStorage.setItem('script_data', JSON.stringify(result.script_data))
+  sessionStorage.setItem('yaml_text', result.yaml_text || '')
+  ElMessage.success(result.message || '转换完成')
+  router.push({ name: 'preview' })
+}
+
+/** 忽略最近任务横幅（按 job_id 记忆） */
+function dismissBanner() {
+  const id = recentJob.value?.job_id
+  if (id) {
+    localStorage.setItem(`dismissed_job_${id}`, '1')
+    recentJob.value = null
+  }
+}
+
+/** 横幅「查看结果」：读取已完成任务结果并进入预览 */
+async function viewJobResult() {
+  const id = recentJob.value?.job_id
+  if (!id) return
+  try {
+    const { job } = await getJob(id, true)
+    if (job?.status === 'completed' && job.result) {
+      handleJobResult(job.result)
+    } else {
+      ElMessage.warning('任务尚未完成，无法查看结果')
+    }
+  } catch {
+    ElMessage.error('读取任务结果失败')
+  }
+}
+
+/** 横幅「取消任务」：通知后端停止（后台线程在分片间停止） */
+async function cancelRecentJob() {
+  const id = recentJob.value?.job_id || currentJobId.value
+  if (!id) return
+  try {
+    await cancelJob(id)
+    ElMessage.info('取消请求已受理，任务将在当前分片完成后停止')
+  } catch (e: any) {
+    ElMessage.warning(e.message || '取消请求失败（任务可能已结束）')
+  }
+  // 若正在通过 SSE 跟踪，同时中断本地连接
+  if (abortController) {
+    abortController.abort()
+  }
+}
 
 const rules: FormRules = {
   novel_title: [
@@ -612,6 +852,7 @@ async function handleTestConnection() {
 
 async function handleSubmit() {
   if (!formRef.value) return
+  if (converting.value || reattaching.value) return // 防重复提交
   try {
     await formRef.value.validate()
   } catch {
@@ -623,6 +864,7 @@ async function handleSubmit() {
   progressLogs.value = []
   totalChunks.value = 0
   completedChunks.value = 0
+  currentJobId.value = null
 
   // 创建 AbortController 用于取消请求
   abortController = new AbortController()
@@ -659,6 +901,38 @@ async function handleSubmit() {
       ElMessage.error(result.message || '转换失败')
     }
   } catch (error: any) {
+    const payload = error?.payload || {}
+    // 防重复：后端返回 duplicate（含进行中任务的 job_id）→ 直接重连该任务
+    if (payload.code === 'duplicate' && payload.job_id) {
+      addLog('start', '检测到相同任务正在进行中，转而跟踪该任务...')
+      ElMessage.info('相同文本的任务正在进行中，已为你恢复其进度')
+      reattachToJob(payload.job_id)
+      return
+    }
+
+    // SSE 意外中断：若后台任务仍在运行，自动切换为轮询恢复，进度不丢失
+    if (currentJobId.value) {
+      try {
+        const { job } = await getJob(currentJobId.value, false)
+        if (job?.status === 'running') {
+          addLog('start', '连接中断，但后台任务仍在运行，正在恢复进度...')
+          reattachToJob(currentJobId.value)
+          return
+        }
+        if (job?.status === 'completed') {
+          const full = await getJob(currentJobId.value, true)
+          if (full.job?.result) {
+            addLog('done', '后台任务已完成！')
+            handleJobResult(full.job.result)
+            converting.value = false
+            return
+          }
+        }
+      } catch {
+        // 查询失败则继续走通用错误提示
+      }
+    }
+
     // 区分不同错误类型给出明确提示
     let msg = error.message || '转换请求失败'
     if (error.name === 'AbortError') {
@@ -676,9 +950,11 @@ async function handleSubmit() {
     addLog('error', msg)
     ElMessage.error(msg)
   } finally {
-    converting.value = false
-    abortController = null
-    stopElapsedTimer()
+    if (!reattaching.value) {
+      converting.value = false
+      abortController = null
+      stopElapsedTimer()
+    }
   }
 }
 
@@ -689,6 +965,11 @@ async function handleSubmit() {
 function handleProgressEvent(event: { stage: string; message: string; data: Record<string, unknown> }) {
   const { stage, message, data } = event
   currentStage.value = message
+
+  // === 任务 ID 捕获（后端在首个进度事件中带回，用于断线重连/取消）===
+  if (data.job_id && !currentJobId.value) {
+    currentJobId.value = data.job_id as string
+  }
 
   // === 流式输出事件处理 ===
   if (stage === 'stream_start') {
@@ -735,6 +1016,9 @@ function handleProgressEvent(event: { stage: string; message: string; data: Reco
   let extra = ''
   if (stage === 'chunk_done' && data.scenes) {
     extra = `(+${data.scenes} 场)`
+  }
+  if (stage === 'chunk_resumed' && data.scenes) {
+    extra = `(复用 +${data.scenes} 场)`
   }
   if (stage === 'chars_extracted' && data.char_count) {
     extra = `${data.char_count} 个角色`
@@ -783,11 +1067,15 @@ const progressPercent = (): number => {
   return Math.round((completedChunks.value / totalChunks.value) * 100)
 }
 
-/** 取消正在进行的转换 */
+/** 取消正在进行的转换（本地中断 SSE + 通知后端停止） */
 function handleCancelConvert() {
   if (abortController) {
     abortController.abort()
     addLog('cancelled', '用户取消转换请求')
+  }
+  // 通知后端：后台线程会在当前分片完成后停止并保存已完成分片
+  if (currentJobId.value) {
+    cancelJob(currentJobId.value).catch(() => {})
   }
 }
 
@@ -796,7 +1084,8 @@ onUnmounted(() => {
   if (abortController) {
     abortController.abort()
   }
-  stopElapsedTimer()
+  stopPolling()
+  window.removeEventListener('beforeunload', handleBeforeUnload)
 })
 </script>
 
@@ -893,6 +1182,97 @@ onUnmounted(() => {
   border-radius: 50%;
   background: var(--border-medium);
 }
+
+/* ====== 最近任务横幅 ====== */
+.job-banner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 20px;
+  margin-bottom: 28px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-card);
+  animation: fadeInUp 0.4s var(--ease-out) both;
+}
+.job-banner.banner-running {
+  border-color: rgba(56, 189, 248, 0.3);
+  background: rgba(56, 189, 248, 0.06);
+}
+.job-banner.banner-running .banner-icon { color: #38bdf8; }
+.job-banner.banner-completed {
+  border-color: rgba(34, 197, 94, 0.3);
+  background: rgba(34, 197, 94, 0.06);
+}
+.job-banner.banner-completed .banner-icon { color: #4ade80; }
+.job-banner.banner-failed,
+.job-banner.banner-cancelled {
+  border-color: rgba(245, 158, 11, 0.3);
+  background: rgba(245, 158, 11, 0.06);
+}
+.job-banner.banner-failed .banner-icon,
+.job-banner.banner-cancelled .banner-icon { color: #fbbf24; }
+
+.banner-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+.icon-spin { animation: spin 1.2s linear infinite; }
+
+.banner-body {
+  flex: 1;
+  min-width: 0;
+}
+.banner-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.banner-progress {
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+  font-size: 11px;
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.1);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  padding: 1px 8px;
+  border-radius: 999px;
+}
+.banner-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.banner-actions {
+  flex-shrink: 0;
+  display: flex;
+  gap: 8px;
+}
+.banner-btn {
+  padding: 6px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: var(--font-ui);
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.banner-btn:hover { border-color: var(--border-medium); color: var(--text-primary); }
+.banner-btn.primary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.banner-btn.primary:hover { background: var(--accent-dim); }
 
 /* ====== 表单区域 ====== */
 .form-section {
@@ -1437,6 +1817,7 @@ onUnmounted(() => {
 .log-chunk_start .log-msg,
 .log-waiting .log-msg { color: var(--accent); }
 .log-chunk_done .log-msg { color: #4ade80; }
+.log-chunk_resumed .log-msg { color: #60a5fa; }
 .log-chunk_fail .log-msg { color: #fb923c; }
 .log-merging .log-msg,
 .log-refining_psy .log-msg { color: #c084fc; }
