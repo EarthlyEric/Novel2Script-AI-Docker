@@ -22,9 +22,9 @@ class AIConfig:
 
     def __init__(
         self,
-        base_url: str = "https://api.openai.com/v1",
+        base_url: str = "",
         api_key: str = "",
-        model_name: str = "gpt-4o-mini",
+        model_name: str = "",
         temperature: float = 0.7,
         max_tokens: int = 16384,
         timeout: int = 300,
@@ -33,9 +33,9 @@ class AIConfig:
         初始化AI配置，优先使用传入参数，否则从环境变量读取，最后使用默认值。
 
         Args:
-            base_url: API基础地址
-            api_key: API密钥
-            model_name: 模型名称
+            base_url: API基础地址（留空时读取 OPENAI_BASE_URL 环境变量）
+            api_key: API密钥（留空时读取 OPENAI_API_KEY 环境变量）
+            model_name: 模型名称（留空时读取 OPENAI_MODEL_NAME 环境变量）
             temperature: 生成温度（0-2之间）
             max_tokens: 最大token数
             timeout: 请求超时秒数

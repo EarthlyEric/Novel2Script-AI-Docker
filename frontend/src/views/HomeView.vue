@@ -126,17 +126,27 @@
           <!-- AI 配置（折叠） -->
           <details class="config-details">
             <summary class="config-summary">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001.51 1 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
               AI 模型配置
+              <span v-if="serverConfigured" class="config-badge ok">服务器已配置</span>
+              <span v-else class="config-badge warn">未配置 · 需填写</span>
               <span class="config-arrow">▾</span>
             </summary>
             <div class="config-body">
+              <div v-if="serverConfigured" class="config-hint ok">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                将使用服务器默认配置（Key: {{ serverConfig?.api_key_masked }} · 模型: {{ serverConfig?.model_name }}），以下留空即可
+              </div>
+              <div v-else class="config-hint warn">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                服务器未配置默认 API，请填写下方信息
+              </div>
               <div class="config-grid">
                 <div class="config-field">
                   <label class="cfg-label">API Key</label>
                   <el-input
                     v-model="form.api_key"
-                    placeholder="sk-..."
+                    :placeholder="serverConfigured ? `留空用默认 (${serverConfig?.api_key_masked})` : 'sk-...'"
                     show-password
                     type="password"
                     size="default"
@@ -146,7 +156,7 @@
                   <label class="cfg-label">API 地址</label>
                   <el-input
                     v-model="form.base_url"
-                    placeholder="https://api.openai.com/v1"
+                    :placeholder="serverConfigured ? '留空使用服务器默认' : 'https://api.openai.com/v1'"
                     size="default"
                   />
                 </div>
@@ -154,9 +164,10 @@
                   <label class="cfg-label">模型</label>
                   <el-select
                     v-model="form.model_name"
-                    placeholder="选择或输入模型"
+                    :placeholder="serverConfigured ? `默认: ${serverConfig?.model_name}` : '选择或输入模型'"
                     allow-create
                     filterable
+                    clearable
                     style="width: 100%"
                   >
                     <el-option label="GPT-4o Mini" value="gpt-4o-mini" />
@@ -181,7 +192,7 @@
                   type="button"
                   class="test-conn-btn"
                   :class="{ testing: testingConn }"
-                  :disabled="testingConn || !form.api_key || !form.base_url || !form.model_name"
+                  :disabled="testingConn || !canTestConnection"
                   @click="handleTestConnection"
                 >
                   <span v-if="!testingConn" class="btn-inner">
@@ -281,10 +292,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, nextTick, onUnmounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, nextTick, onMounted, onUnmounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
-import { convertNovelStream, testConnection } from '@/api/script'
+import { convertNovelStream, testConnection, getConfigStatus } from '@/api/script'
+import type { ConfigStatus } from '@/types/script'
 import JSZip from 'jszip'
 
 const router = useRouter()
@@ -356,7 +368,28 @@ const form = reactive({
   novel_text: '',
   api_key: '',
   base_url: '',
-  model_name: 'gpt-4o-mini',
+  model_name: '',
+})
+
+// 服务器端 AI 配置状态（env_file 注入的 OPENAI_* 环境变量）
+const serverConfig = ref<ConfigStatus | null>(null)
+
+/** 服务器是否已配置完整 AI 信息（可留空表单直接提交） */
+const serverConfigured = computed(() => serverConfig.value?.configured === true)
+
+/** 表单 AI 配置是否完整填写 */
+const formConfigComplete = computed(() => !!(form.api_key && form.base_url && form.model_name))
+
+/** 「测试连接」可用条件：表单填写完整，或服务器已配置默认值 */
+const canTestConnection = computed(() => formConfigComplete.value || serverConfigured.value)
+
+onMounted(async () => {
+  try {
+    serverConfig.value = await getConfigStatus()
+  } catch {
+    // 查询失败按未配置处理，不影响表单手动填写
+    serverConfig.value = { configured: false, api_key_masked: '', base_url: '', model_name: '' }
+  }
 })
 
 const rules: FormRules = {
@@ -552,7 +585,7 @@ function handleFileRemove() {
  * 发送最简请求验证 API Key / Base URL / 模型名是否有效
  */
 async function handleTestConnection() {
-  if (!form.api_key || !form.base_url || !form.model_name) {
+  if (!formConfigComplete.value && !serverConfigured.value) {
     ElMessage.warning('请先填写完整的 AI 配置信息')
     return
   }
@@ -583,12 +616,6 @@ async function handleSubmit() {
     await formRef.value.validate()
   } catch {
     ElMessage.warning('请完善表单信息')
-    return
-  }
-
-  // 提交前检查 AI 配置是否完整
-  if (!form.api_key || !form.base_url || !form.model_name) {
-    ElMessage.warning('请先填写完整的 AI 模型配置（API Key / 地址 / 模型名）')
     return
   }
 
@@ -1057,6 +1084,51 @@ onUnmounted(() => {
   margin-left: auto;
   font-size: 10px;
   transition: transform 0.25s var(--ease-out);
+}
+
+/* 配置状态徽章（折叠面板标题右侧） */
+.config-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  letter-spacing: 0.5px;
+  margin-left: auto;
+}
+.config-badge.ok {
+  background: rgba(34, 197, 94, 0.12);
+  color: #4ade80;
+  border: 1px solid rgba(34, 197, 94, 0.25);
+}
+.config-badge.warn {
+  background: rgba(245, 158, 11, 0.12);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.25);
+}
+.config-badge + .config-arrow {
+  margin-left: 8px;
+}
+
+/* 配置提示行（服务器默认配置状态说明） */
+.config-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm, 6px);
+  margin-bottom: 14px;
+  line-height: 1.5;
+}
+.config-hint.ok {
+  background: rgba(34, 197, 94, 0.08);
+  color: #4ade80;
+  border: 1px solid rgba(34, 197, 94, 0.18);
+}
+.config-hint.warn {
+  background: rgba(245, 158, 11, 0.08);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.18);
 }
 
 .config-body {

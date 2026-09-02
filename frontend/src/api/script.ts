@@ -12,7 +12,7 @@
  * - POST /api/script/validate        — 校验YAML内容
  */
 import axios from 'axios'
-import type { ConvertParams, ConvertResult, ValidateResult } from '@/types/script'
+import type { ConvertParams, ConvertResult, ConfigStatus, ValidateResult } from '@/types/script'
 
 /**
  * axios 实例，配置基础URL、超时时间和拦截器
@@ -213,24 +213,37 @@ export async function getSchemaInfo(): Promise<unknown> {
 }
 
 /**
+ * 查询服务器端 AI 配置状态
+ *
+ * 判断服务器是否已通过环境变量配置 API 信息，
+ * 前端据此决定 AI 配置表单是否可留空。
+ *
+ * @returns 配置状态（configured/api_key_masked/base_url/model_name）
+ */
+export async function getConfigStatus(): Promise<ConfigStatus> {
+  return request.get('/script/config-status')
+}
+
+/**
  * 测试 LLM 模型接口连通性
  *
- * 发送最简请求验证 API Key、Base URL、模型名是否有效
+ * 发送最简请求验证 API Key、Base URL、模型名是否有效。
+ * 三个参数均可选：全部留空时由后端使用服务器端环境变量配置测试。
  *
- * @param apiKey - API 密钥
- * @param baseUrl - API 地址
- * @param modelName - 模型名称
+ * @param apiKey - API 密钥（可选）
+ * @param baseUrl - API 地址（可选）
+ * @param modelName - 模型名称（可选）
  * @returns 测试结果，包含 success/message/latency_ms 等
  */
 export async function testConnection(
-  apiKey: string,
-  baseUrl: string,
-  modelName: string,
+  apiKey?: string,
+  baseUrl?: string,
+  modelName?: string,
 ): Promise<{ success: boolean; message: string; latency_ms?: number; model?: string; reply_preview?: string }> {
   const formData = new FormData()
-  formData.append('api_key', apiKey)
-  formData.append('base_url', baseUrl)
-  formData.append('model_name', modelName)
+  if (apiKey) formData.append('api_key', apiKey)
+  if (baseUrl) formData.append('base_url', baseUrl)
+  if (modelName) formData.append('model_name', modelName)
 
   return request.post('/script/test-connection', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },

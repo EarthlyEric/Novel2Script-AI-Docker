@@ -31,6 +31,68 @@ from backend.services.yaml_renderer import render_script_yaml
 router = APIRouter(prefix="/script", tags=["剧本转换"])
 
 
+def _mask_api_key(api_key: str) -> str:
+    """
+    遮罩 API Key，仅保留前5个字符用于界面提示。
+
+    Args:
+        api_key: 完整 API Key
+
+    Returns:
+        str: 遮罩后的形式，如 "sk-T6..."；空 Key 返回空字符串
+    """
+    if not api_key:
+        return ""
+    return f"{api_key[:5]}..."
+
+
+def _resolve_ai_params(
+    api_key: str | None,
+    base_url: str | None,
+    model_name: str | None,
+) -> tuple[str, str, str]:
+    """
+    将前端可选参数与环境变量默认值合并。
+
+    优先级：前端传入值 > OPENAI_* 环境变量 > 空字符串。
+
+    Args:
+        api_key: 前端传入的 API Key（可为空）
+        base_url: 前端传入的 API 地址（可为空）
+        model_name: 前端传入的模型名称（可为空）
+
+    Returns:
+        tuple[str, str, str]: (api_key, base_url, model_name) 合并后的有效配置
+    """
+    default_config = AIConfig()
+    return (
+        api_key or default_config.api_key,
+        base_url or default_config.base_url,
+        model_name or default_config.model_name,
+    )
+
+
+@router.get("/config-status")
+async def get_config_status():
+    """
+    查询服务器端 AI 配置状态。
+
+    用于前端判断是否可以留空 AI 配置（使用服务器默认值）。
+    安全性：绝不返回完整 API Key，仅返回前5个字符的遮罩形式。
+
+    Returns:
+        dict: 包含 configured/api_key_masked/base_url/model_name 的配置状态
+    """
+    config = AIConfig()
+    configured = bool(config.api_key and config.base_url and config.model_name)
+    return {
+        "configured": configured,
+        "api_key_masked": _mask_api_key(config.api_key),
+        "base_url": config.base_url,
+        "model_name": config.model_name,
+    }
+
+
 def log(msg: str) -> None:
     """
     立即刷新的日志输出函数。
@@ -363,9 +425,9 @@ async def convert_novel_to_script_stream(
 
 @router.post("/test-connection")
 async def test_llm_connection(
-    api_key: str = Form(..., description="API Key"),
-    base_url: str = Form(..., description="API Base URL"),
-    model_name: str = Form(..., description="模型名称"),
+    api_key: str = Form(default="", description="可选：API Key，留空使用服务器配置"),
+    base_url: str = Form(default="", description="可选：API Base URL，留空使用服务器配置"),
+    model_name: str = Form(default="", description="可选：模型名称，留空使用服务器配置"),
 ):
     """
     测试 LLM 模型接口连通性。
@@ -377,13 +439,22 @@ async def test_llm_connection(
     - 接口是否正常响应
 
     Args:
-        api_key: API 密钥
-        base_url: API 地址
-        model_name: 模型名称
+        api_key: API 密钥（留空时使用服务器 OPENAI_API_KEY 环境变量）
+        base_url: API 地址（留空时使用服务器 OPENAI_BASE_URL 环境变量）
+        model_name: 模型名称（留空时使用服务器 OPENAI_MODEL_NAME 环境变量）
 
     Returns:
         dict: 包含 success/message/latency/model 的测试结果
     """
+    # 合并服务器默认配置；三项均缺失时直接拒绝（避免被下方异常处理器吞掉）
+    api_key, base_url, model_name = _resolve_ai_params(api_key, base_url, model_name)
+    if not api_key or not base_url or not model_name:
+        log("[TEST] 服务器未配置 API 且前端未填写，拒绝测试")
+        raise HTTPException(
+            status_code=400,
+            detail="服务器未配置 API（缺少 OPENAI_* 环境变量），请填写完整的 AI 配置",
+        )
+
     from openai import (
         OpenAI,
         AuthenticationError,

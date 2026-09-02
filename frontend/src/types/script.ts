@@ -123,6 +123,18 @@ export interface ValidateResult {
   errors: string[] | null
 }
 
+/** 服务器端 AI 配置状态 */
+export interface ConfigStatus {
+  /** 服务器是否已配置完整的 AI 连接信息 */
+  configured: boolean
+  /** 遮罩后的 API Key（如 "sk-T6..."，未配置为空字符串） */
+  api_key_masked: string
+  /** 服务器默认 API Base URL */
+  base_url: string
+  /** 服务器默认模型名称 */
+  model_name: string
+}
+
 /** 单元类型到中文标签的映射 */
 export const UNIT_TYPE_LABELS: Record<SceneContentUnit['unit_type'], string> = {
   action: '动作',

@@ -133,3 +133,7 @@ dmypy.json
 
 docs/
 text/
+# =========================
+# Docker
+# =========================
+docker-compose.override.yml
